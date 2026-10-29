@@ -117,7 +117,7 @@ been measured.
 
 | Command | What it does |
 |---|---|
-| `hotpress dev` | Production build into `dist/`, served like the host (see below). Rebuilds and reloads on change |
+| `hotpress dev` | Production build into `.hotpress-cache/dev/`, served like the host (see below). Rebuilds and reloads on change |
 | `hotpress build` | Production build plus the change report |
 | `hotpress serve [dir]` | Serve an existing build like the host |
 | `hotpress check` | Every pre-publish check, no git (below) |
@@ -128,7 +128,9 @@ been measured.
 **Preview** (`dev`, `serve`) uses the host simulator from the parity checker: `x/index.html`, a 301 from
 `/x` to `/x/`, `_redirects`, `_headers`, and `404.html` with status 404. The only differences from
 production: a live-reload script injected when the page is served, and `usePage().mode === "preview"`, which
-site components use to leave out analytics and ads (the recipe does this).
+site components use to leave out analytics and ads (the recipe does this). `dev` builds into
+`.hotpress-cache/dev/`, never `dist/`, so a preview build can't be deployed and a `build` or `check` run
+alongside it can't change what it serves.
 
 ## `hotpress check` and `hotpress publish`
 

@@ -76,7 +76,7 @@ defineSite({
 ## Workflow
 
 ```bash
-npm run dev                         # preview (production build, host rules, live reload)
+npm run dev                         # preview (production build, host rules, live reload; never writes dist/)
 npx hotpress check --json           # what would block a publish, as structured problems
 npx hotpress publish -m "Add post about X" --all --json
 ```

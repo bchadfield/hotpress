@@ -171,17 +171,31 @@ export interface DevOptions {
   port: number;
   /** Render third-party scripts (analytics, ads) as in production. */
   thirdParty?: boolean;
+  log?: boolean;
 }
+
+export interface DevServer {
+  url: string;
+  outDir: string;
+  close(): Promise<void>;
+}
+
+/**
+ * Where dev builds. Never `dist`: a preview-mode build there could be deployed, and a `build` or `check`
+ * run alongside dev would overwrite what dev is serving.
+ */
+export const DEV_OUT_DIR = join(".hotpress-cache", "dev");
 
 const IGNORED = /(^|[/\\])(node_modules|\.git|\.hotpress-cache|dist)([/\\]|$)/;
 
-/** Production build + host-accurate preview + rebuild and reload on change. */
-export async function dev(options: DevOptions): Promise<void> {
+/** Production build + host-accurate preview + rebuild and reload on change, until closed. */
+export async function startDev(options: DevOptions): Promise<DevServer> {
   const mode = options.thirdParty ? "production" : "preview";
-  const first = await build({ root: options.root, configFile: options.configFile, mode });
-  const outDir = first.outDir || join(options.root, "dist");
-  const server = await serve({ dir: outDir, port: options.port, liveReload: true });
-  if (!options.thirdParty) process.stdout.write("Third-party scripts are off in preview (usePage().mode === \"preview\"); use --third-party to include them.\n");
+  const buildOptions = { root: options.root, configFile: options.configFile, mode, outDir: DEV_OUT_DIR, log: options.log } as const;
+  const first = await build(buildOptions);
+  const outDir = first.outDir || join(options.root, DEV_OUT_DIR);
+  const server = await serve({ dir: outDir, port: options.port, liveReload: true, log: options.log === false ? () => {} : undefined });
+  if (!options.thirdParty && options.log !== false) process.stdout.write("Third-party scripts are off in preview (usePage().mode === \"preview\"); use --third-party to include them.\n");
 
   let timer: NodeJS.Timeout | undefined;
   let running = false;
@@ -192,7 +206,7 @@ export async function dev(options: DevOptions): Promise<void> {
       return;
     }
     running = true;
-    const result = await build({ root: options.root, configFile: options.configFile, mode }).catch((error: Error) => ({ ok: false, problems: [{ code: "crash", message: error.stack ?? String(error) }] }));
+    const result = await build(buildOptions).catch((error: Error) => ({ ok: false, problems: [{ code: "crash", message: error.stack ?? String(error) }] }));
     if (result.ok) {
       await server.refresh();
       server.broadcast("reload");
@@ -211,11 +225,22 @@ export async function dev(options: DevOptions): Promise<void> {
     clearTimeout(timer);
     timer = setTimeout(rebuild, 80);
   });
-  await new Promise<void>((resolve) => {
-    const stop = () => {
+  return {
+    url: server.url,
+    outDir,
+    async close() {
+      clearTimeout(timer);
       watcher.close();
-      void server.close().then(resolve);
-    };
+      await server.close();
+    }
+  };
+}
+
+/** `hotpress dev`: run until interrupted. */
+export async function dev(options: DevOptions): Promise<void> {
+  const server = await startDev(options);
+  await new Promise<void>((resolve) => {
+    const stop = () => void server.close().then(resolve);
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
   });

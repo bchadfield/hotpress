@@ -222,7 +222,8 @@ async function writeOutputs(
   pageFiles: Set<string>,
   mode: Mode
 ): Promise<ChangeReport> {
-  const manifestPath = join(cacheDir, "build-manifest.json");
+  // One manifest per output directory: it records what is on disk there, and dev builds elsewhere.
+  const manifestPath = join(cacheDir, `build-manifest-${sha1(outDir).slice(0, 12)}.json`);
   const indexPath = join(cacheDir, `pages-${mode}.json`);
   const previous = await readJson<Manifest>(manifestPath);
   const last = await readJson<PageIndex>(indexPath);

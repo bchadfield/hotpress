@@ -90,7 +90,7 @@ Drafts, scheduling, ads and analytics are your code: see `examples/basic` and [A
 
 | | |
 |---|---|
-| `hotpress dev [--port] [--third-party]` | Production build served like the host, rebuilt and reloaded on change |
+| `hotpress dev [--port] [--third-party]` | Production build into `.hotpress-cache/dev/`, served like the host, rebuilt and reloaded on change. `dist/` is left to `build` |
 | `hotpress build [--check]` | Build to `dist/` and report which pages changed; `--check` also runs every offline check and fails on any problem (use it as the CI build) |
 | `hotpress serve [dir]` | Serve a build like the host |
 | `hotpress check [--twice] [--json]` | Every pre-publish check |
