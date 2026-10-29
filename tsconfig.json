@@ -12,7 +12,7 @@
     "verbatimModuleSyntax": true,
     "erasableSyntaxOnly": true,
     "jsx": "react-jsx",
-    "jsxImportSource": "hotpress",
+    "jsxImportSource": "@benchadfield/hotpress",
     "types": ["node"],
     "declaration": true,
     "outDir": "dist",

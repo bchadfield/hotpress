@@ -32,11 +32,14 @@ function clientPlugin(state: BundleState): esbuild.Plugin {
       });
       build.onLoad({ filter: /.*/, namespace: "hotpress-client" }, (args) => {
         state.clientScripts.add(args.path);
-        return { contents: `import { clientScript } from "hotpress";\nexport default clientScript(${JSON.stringify(args.path)});\n`, loader: "js", resolveDir: state.root };
+        return { contents: `import { clientScript } from "${PACKAGE}";\nexport default clientScript(${JSON.stringify(args.path)});\n`, loader: "js", resolveDir: state.root };
       });
     }
   };
 }
+
+// The package name sites import, for generated imports and the JSX runtime.
+const PACKAGE = "@benchadfield/hotpress";
 
 let buildCounter = 0;
 
@@ -54,7 +57,7 @@ async function loadMdx(root: string): Promise<MdxCompile> {
   }
   mdxCompiler = async (source, file, options) => {
     const compiled = await mod.compile(source, {
-      jsxImportSource: "hotpress",
+      jsxImportSource: PACKAGE,
       outputFormat: "program",
       development: false,
       remarkPlugins: options.remarkPlugins,
@@ -114,7 +117,7 @@ function serverOptions(state: BundleState, mdx: MdxCompileOptions = {}): esbuild
     target: "node22",
     packages: "external",
     jsx: "automatic",
-    jsxImportSource: "hotpress",
+    jsxImportSource: PACKAGE,
     loader: { ".svg": "text", ".txt": "text", ".md": "text", ".html": "text" },
     absWorkingDir: state.root,
     metafile: true,
@@ -258,7 +261,7 @@ export async function bundleClientScripts(state: BundleState, entries: string[],
       write: false,
       logLevel: "silent",
       jsx: "automatic",
-      jsxImportSource: "hotpress"
+      jsxImportSource: PACKAGE
     });
   } catch (error) {
     throw bundleError(error, state.root);

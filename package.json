@@ -1,8 +1,11 @@
 {
-  "name": "hotpress",
+  "name": "@benchadfield/hotpress",
   "version": "0.1.0",
   "description": "A small static site generator for content sites: collections, hierarchies, JSX components and SEO output, plus a parity checker.",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "author": "Ben Chadfield",
   "repository": {
     "type": "git",

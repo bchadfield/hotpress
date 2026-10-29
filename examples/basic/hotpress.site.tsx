@@ -1,5 +1,5 @@
 // Example site: a Markdown blog and a CSV-driven place directory with generated nested indexes.
-import { absoluteUrl, atom, csv, defineSite, groupBy, markdown, mdx, paginate, related, robots, s, sitemaps, tree } from "hotpress";
+import { absoluteUrl, atom, csv, defineSite, groupBy, markdown, mdx, paginate, related, robots, s, sitemaps, tree } from "@benchadfield/hotpress";
 import { site as siteInfo } from "./src/Layout.tsx";
 import { NotePage, NotFound, PlaceIndex, PlacePage, PostList, PostPage, placeUrl, type Place, type Post } from "./src/templates.tsx";
 import updated from "./data/updated.json" with { type: "json" };

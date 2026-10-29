@@ -1,4 +1,4 @@
-import { ancestors, raw, Script, type Entry, type PageOf, type TreeNode } from "hotpress";
+import { ancestors, raw, Script, type Entry, type PageOf, type TreeNode } from "@benchadfield/hotpress";
 import { Breadcrumbs, Layout } from "./Layout.tsx";
 import filter from "./filter.ts?client";
 
@@ -122,7 +122,7 @@ export function PlacePage(props: { place: Entry<Place>; node: TreeNode<Entry<Pla
   );
 }
 
-export function NotePage(props: { title: string; children?: import("hotpress").Child }) {
+export function NotePage(props: { title: string; children?: import("@benchadfield/hotpress").Child }) {
   return (
     <Layout title={`${props.title} | Example Places`} description={props.title}>
       <article>{props.children}</article>

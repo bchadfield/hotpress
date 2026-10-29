@@ -1,4 +1,4 @@
-import { raw, usePage, JsonLd, type Child } from "hotpress";
+import { raw, usePage, JsonLd, type Child } from "@benchadfield/hotpress";
 
 export interface LayoutProps {
   title: string;

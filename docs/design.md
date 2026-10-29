@@ -38,7 +38,7 @@ declarative config, so a site can do anything without the engine knowing about i
 
 ```tsx
 // hotpress.site.tsx
-import { defineSite, markdown, csv, s, sitemap, robots } from "hotpress";
+import { defineSite, markdown, csv, s, sitemap, robots } from "@benchadfield/hotpress";
 import { Post, Home, Area } from "./src/templates";
 
 export default defineSite({

@@ -14,7 +14,7 @@
     "resolveJsonModule": true,
     "skipLibCheck": true,
     "jsx": "react-jsx",
-    "jsxImportSource": "hotpress",
+    "jsxImportSource": "@benchadfield/hotpress",
     "customConditions": [
       "hotpress-source"
     ],

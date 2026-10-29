@@ -1,6 +1,6 @@
-// Ambient types for Hotpress import suffixes. Add "hotpress/client" to compilerOptions.types.
+// Ambient types for Hotpress import suffixes. Add "@benchadfield/hotpress/client" to compilerOptions.types.
 declare module "*?client" {
-  const script: import("hotpress").ClientScript;
+  const script: import("@benchadfield/hotpress").ClientScript;
   export default script;
 }
 declare module "*.svg" {

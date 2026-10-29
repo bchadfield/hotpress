@@ -21,13 +21,13 @@ rules, ads, analytics) is plain code in your repo, with no plugin system to figh
 ## Quick start
 
 ```bash
-npm install hotpress
+npm install @benchadfield/hotpress
 ```
 
 `hotpress.site.tsx`:
 
 ```tsx
-import { defineSite, markdown, csv, s, sitemaps, robots, absoluteUrl } from "hotpress";
+import { defineSite, markdown, csv, s, sitemaps, robots, absoluteUrl } from "@benchadfield/hotpress";
 import { Layout } from "./src/Layout.tsx";
 
 export default defineSite({
@@ -60,7 +60,7 @@ export default defineSite({
 ```
 
 `package.json` scripts: `"dev": "hotpress dev"`, `"build": "hotpress build"`.
-`tsconfig.json`: `"jsx": "react-jsx"`, `"jsxImportSource": "hotpress"`, `"types": ["node", "hotpress/client"]`.
+`tsconfig.json`: `"jsx": "react-jsx"`, `"jsxImportSource": "@benchadfield/hotpress"`, `"types": ["node", "@benchadfield/hotpress/client"]`.
 
 ## Content model
 

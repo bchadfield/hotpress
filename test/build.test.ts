@@ -7,7 +7,7 @@ import { build } from "../src/build/build.ts";
 import { runDiff } from "../src/diff/index.ts";
 
 const EXAMPLE = new URL("../examples/basic/", import.meta.url).pathname;
-// Inside the package so the example's `import "hotpress"` resolves to this checkout.
+// Inside the package so the example's `import "@benchadfield/hotpress"` resolves to this checkout.
 const TMP = new URL("./.tmp/", import.meta.url).pathname;
 
 async function copyExample(): Promise<string> {
