@@ -1,0 +1,5 @@
+:root { --ink: #1d2433; --accent: #0b7a75; }
+body { margin: 0 auto; max-width: 42rem; padding: 1rem; font: 1rem/1.6 system-ui, sans-serif; color: var(--ink); }
+a { color: var(--accent); }
+nav ol { display: flex; gap: .5rem; list-style: none; padding: 0; }
+nav li + li::before { content: "›"; margin-right: .5rem; }

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.baselines/
+.hotpress-cache/
+*.tsbuildinfo
+coverage/
+test/.tmp/
+.claude/
