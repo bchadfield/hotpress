@@ -1,11 +1,13 @@
 #!/usr/bin/env node
-import { writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 
 const HELP = `hotpress <command>
 
 Commands
+  init  [dir] [--origin https://example.com] [--name "Site name"]   Start a new site (a working starter)
   build [--config hotpress.site.tsx] [--out dist]     Production build + change report
         [--check]                                     ...then every offline check; fails on any problem (for CI)
   dev   [--port 4321] [--third-party]                 Production build served like the host, live reload
@@ -30,6 +32,14 @@ async function main(argv: string[]): Promise<number> {
     process.stdout.write(HELP);
     return 0;
   }
+  if (command === "init") {
+    const { values, positionals } = parseArgs({ args: rest, allowPositionals: true, options: { origin: { type: "string" }, name: { type: "string" } } });
+    const root = resolve(positionals[0] ?? ".");
+    await mkdir(root, { recursive: true });
+    const { init } = await import("./init.ts");
+    await init({ root, origin: values.origin, name: values.name });
+    return 0;
+  }
   if (command === "diff") {
     const { values, positionals } = parseArgs({
       args: rest,
@@ -45,6 +55,11 @@ async function main(argv: string[]): Promise<number> {
     });
     if (positionals.length !== 2) {
       process.stderr.write("usage: hotpress diff <baseline> <candidate>\n");
+      return 2;
+    }
+    const missing = positionals.filter((dir) => !existsSync(resolve(dir)));
+    if (missing.length) {
+      process.stderr.write(`hotpress diff: no such directory: ${missing.join(", ")}\n`);
       return 2;
     }
     const { runDiff, formatReport } = await import("./diff/index.ts");

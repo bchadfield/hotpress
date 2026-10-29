@@ -27,7 +27,7 @@ export interface SitemapOptions {
   maxUrls?: number;
   /** Split above this many bytes per file (default 45 MB; the limit is 50 MB). */
   maxBytes?: number;
-  /** File name pattern for split parts, given the index (1-based). Default "sitemap-{n}.xml". */
+  /** File name for split part n (1-based). Default: the index name with "-n" before ".xml" ("sitemap-1.xml"). */
   partName?: (n: number) => string;
   /** Lines before <urlset> etc. Default: XML declaration. */
   header?: string;
@@ -74,10 +74,11 @@ export function sitemaps(file: string, origin: string, urls: SitemapUrl[], optio
     bytes += size;
   }
   if (current.length) chunks.push(current);
-  const partName = options.partName ?? ((n: number) => file.replace(/\.xml$/, `-${n}.xml`));
+  const partName = options.partName ?? ((n: number) => `${file.replace(/\.xml$/, "")}-${n}.xml`);
   const out: Record<string, string> = {};
   const entries = chunks.map((chunk, i) => {
     const name = partName(i + 1);
+    if (name === file || name in out) throw new Error(`sitemaps(): part ${i + 1} is named "${name}", which another sitemap file already uses`);
     out[name] = wrap(chunk);
     return `${ind}<sitemap>\n${ind}${ind}<loc>${xmlEscape(absoluteUrl(origin, "/" + name.replace(/^\/+/, "")))}</loc>\n${ind}</sitemap>`;
   });

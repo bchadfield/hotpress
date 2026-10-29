@@ -50,12 +50,12 @@ export class StaticHost {
       const params = matchRule(rule.from, path);
       if (!params) continue;
       const to = applyParams(rule.to, params);
-      if (rule.status === 200) {
-        // Rewrite: serve the target's file with the rule's status.
-        const inner = /^https?:/.test(to) ? null : this.fileFor(to);
-        return inner ?? { status: 404 };
-      }
-      return { status: rule.status, location: to };
+      if (rule.status >= 300 && rule.status < 400) return { status: rule.status, location: to };
+      // Any other status is a rewrite: serve the target's file with the rule's status
+      // (200 for a proxy-style rewrite, 404 or 410 for a custom error page).
+      const inner = /^https?:/.test(to) ? null : this.fileFor(to);
+      if (rule.status === 200) return inner ?? { status: 404 };
+      return inner?.file ? { status: rule.status, file: inner.file } : { status: rule.status };
     }
     return null;
   }

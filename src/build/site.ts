@@ -101,11 +101,22 @@ export function defineSite(options: SiteOptions): SiteOptions {
   return options;
 }
 
+/** An output path relative to the out dir (no leading slash), which must stay inside it. */
+function safeOutputPath(path: string, what: string): string {
+  const segments = path.split("/");
+  const bad = segments.some((segment, i) => segment === "." || segment === ".." || (segment === "" && i < segments.length - 1));
+  if (bad || path.includes("\\") || path.includes("\0")) {
+    throw new Error(`${what} "${path}" must not contain "." or ".." segments, empty segments ("//"), backslashes or NUL`);
+  }
+  return path;
+}
+
 export function urlToFile(url: string): string {
   if (!url.startsWith("/")) throw new Error(`page URL must start with "/": "${url}"`);
-  const path = decodeURI(url.split(/[?#]/)[0]);
-  if (path.endsWith("/")) return `${path.slice(1)}index.html`;
-  if (/\.[A-Za-z0-9]+$/.test(path.split("/").pop()!)) return path.slice(1);
+  if (/[?#]/.test(url)) throw new Error(`page URL "${url}" must not have a query or fragment`);
+  const path = safeOutputPath(decodeURI(url).slice(1), "page URL");
+  if (path === "" || path.endsWith("/")) return `${path}index.html`;
+  if (/\.[A-Za-z0-9]+$/.test(path.split("/").pop()!)) return path;
   throw new Error(`page URL "${url}" must end with "/" or a file extension (e.g. "/about/" or "/404.html")`);
 }
 
@@ -158,7 +169,14 @@ export class Site {
 
   /** Add a non-HTML file (sitemap, robots.txt, JSON…). A function is evaluated after pages render. */
   file(path: string, content: FileRecord["content"]): void {
-    const file = path.replace(/^\/+/, "");
+    let file: string;
+    try {
+      file = safeOutputPath(path.replace(/^\/+/, ""), "file path");
+      if (!file || file.endsWith("/")) throw new Error(`file path "${path}" must name a file`);
+    } catch (error) {
+      this.problems.push({ code: "bad-url", message: (error as Error).message, url: path });
+      return;
+    }
     if (this.claim(file, `file ${file}`)) this.files.push({ file, content });
   }
 
@@ -166,6 +184,11 @@ export class Site {
   async css(entry: string, options: AssetOptions & { build?: (file: string) => Promise<string> | string } = {}): Promise<string> {
     const out = await bundleCss(this.state, entry, options);
     if (this.claim(out.path, `stylesheet ${entry}`)) this.assets.set(out.path, out.contents);
+    for (const [file, contents] of out.files) {
+      // Two stylesheets may share a font: same content, same hashed name.
+      if (this.assets.has(file) && Buffer.compare(this.assets.get(file)!, contents) === 0) continue;
+      if (this.claim(file, `file used by stylesheet ${entry}`)) this.assets.set(file, contents);
+    }
     return `/${out.path}`;
   }
 

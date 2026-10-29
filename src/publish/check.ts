@@ -2,11 +2,11 @@
 
 import { readFileSync } from "node:fs";
 import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { build, type BuildResult } from "../build/build.ts";
 import type { PageMeta, SiteTask, TaskPage, TaskResult } from "../build/site.ts";
 import { formatProblem, type Problem } from "../errors.ts";
-import { globToRegExp, listFiles } from "../diff/files.ts";
+import { fileToUrl, globToRegExp, listFiles } from "../diff/files.ts";
 import { StaticHost } from "../diff/host.ts";
 import { extractPage, type PageSeo } from "../diff/html.ts";
 import { findBrokenLinks } from "../diff/index.ts";
@@ -23,8 +23,10 @@ export interface CheckOptions {
   allow?: string[];
   /** Skip checks that need the network (the live sitemap). */
   offline?: boolean;
-  /** Published index to compare with (default <root>/.hotpress-cache/published.json). */
+  /** Published index to compare with (default <root>/hotpress.published.json, committed by publish). */
   publishedIndex?: string;
+  /** Read this instead when the published index doesn't exist (older versions kept it in .hotpress-cache). */
+  legacyIndex?: string;
   /** Let the site's tasks update files (publish, `check --fix`). */
   fix?: boolean;
   /** Publish date for tasks, YYYY-MM-DD (default: HOTPRESS_TODAY, else today in UTC). */
@@ -48,27 +50,50 @@ export interface CheckResult {
   fixed: string[];
 }
 
-/** What was last published: used to spot removed URLs and content changes without a new date. */
+/**
+ * What was last published: used to spot removed URLs and content changes without a new date.
+ * `publish` commits it with each change, so every clone and CI build compares with the same history.
+ */
 export interface PublishedIndex {
-  version: 1;
+  version: 2;
   origin: string;
   pages: Record<string, { text: string; updated?: string }>;
-  /** Every URL that served a 200 (pages and files). */
+  /** Every URL that served a 200, except bundled assets (their names change with their content). */
   urls: string[];
 }
 
-export async function readPublishedIndex(path: string): Promise<PublishedIndex | undefined> {
-  try {
-    const index = JSON.parse(await readFile(path, "utf8")) as PublishedIndex;
-    return index.version === 1 ? index : undefined;
-  } catch {
-    return undefined;
+/** File name of the published index, in the site root. */
+export const PUBLISHED_INDEX = "hotpress.published.json";
+
+/** Hashed bundle names from older indexes, which listed bundled assets too. */
+const LEGACY_ASSET = /(^|\/)(chunk\.)?[^/]*\.[A-Za-z0-9_-]{8,}\.(css|js|mjs)$/;
+
+export async function readPublishedIndex(path: string, legacy?: string): Promise<PublishedIndex | undefined> {
+  for (const file of legacy ? [path, legacy] : [path]) {
+    let index: { version: number } & Omit<PublishedIndex, "version">;
+    try {
+      index = JSON.parse(await readFile(file, "utf8"));
+    } catch {
+      continue;
+    }
+    if (index.version === 2) return index as PublishedIndex;
+    if (index.version === 1) return { ...index, version: 2, urls: index.urls.filter((u) => !LEGACY_ASSET.test(u)) };
   }
+  return undefined;
+}
+
+/** One page or URL per line, sorted, so a publish's diff of the index shows what it changed. */
+export function formatPublishedIndex(index: PublishedIndex): string {
+  const pages = Object.keys(index.pages)
+    .sort()
+    .map((url) => `    ${JSON.stringify(url)}: ${JSON.stringify(index.pages[url])}`);
+  const urls = [...index.urls].sort().map((url) => `    ${JSON.stringify(url)}`);
+  return `{\n  "version": ${index.version},\n  "origin": ${JSON.stringify(index.origin)},\n  "pages": {\n${pages.join(",\n")}\n  },\n  "urls": [\n${urls.join(",\n")}\n  ]\n}\n`;
 }
 
 export async function writePublishedIndex(path: string, index: PublishedIndex): Promise<void> {
-  await mkdir(join(path, ".."), { recursive: true });
-  await writeFile(path, JSON.stringify(index));
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, formatPublishedIndex(index));
 }
 
 function allowedBy(problem: Problem, rules: string[]): boolean {
@@ -134,8 +159,11 @@ export async function check(options: CheckOptions): Promise<CheckResult> {
   const redirectsText = await readFile(join(built.outDir, "_redirects"), "utf8").catch(() => "");
   const host = new StaticHost(files, parseRedirects(redirectsText));
   const pages = new Map<string, PageSeo>();
+  const noDoctype = new Set<string>();
   await mapLimit(built.pages, 32, async (p) => {
-    pages.set(p.file, extractPage(await readFile(join(built.outDir, p.file), "utf8")));
+    const html = await readFile(join(built.outDir, p.file), "utf8");
+    pages.set(p.file, extractPage(html));
+    if (p.file.endsWith(".html") && !/^\uFEFF?\s*(<!--[\s\S]*?-->\s*)*<!doctype html[\s>]/i.test(html)) noDoctype.add(p.file);
   });
 
   // Links, canonicals and og:image must resolve.
@@ -147,6 +175,8 @@ export async function check(options: CheckOptions): Promise<CheckResult> {
   if (settings.seo !== false) {
     for (const p of built.pages) {
       const seo = pages.get(p.file)!;
+      // Without a doctype, browsers render in quirks mode: a layout bug on every page, indexed or not.
+      if (noDoctype.has(p.file)) problems.push({ code: "seo", url: p.url, field: "doctype", message: "missing <!DOCTYPE html>", hint: 'start the layout with {raw("<!DOCTYPE html>")}' });
       if (p.meta.noindex || seo.robots.some((r) => r.includes("noindex"))) continue;
       const self = origin + p.url;
       if (!seo.title.some(Boolean)) problems.push({ code: "seo", url: p.url, field: "title", message: "missing <title>" });
@@ -157,8 +187,8 @@ export async function check(options: CheckOptions): Promise<CheckResult> {
   }
 
   // Nothing that was published may disappear without a redirect.
-  const indexPath = options.publishedIndex ?? join(options.root, ".hotpress-cache", "published.json");
-  const previous = await readPublishedIndex(indexPath);
+  const indexPath = options.publishedIndex ?? join(options.root, PUBLISHED_INDEX);
+  const previous = await readPublishedIndex(indexPath, options.legacyIndex ?? join(options.root, ".hotpress-cache", "published.json"));
   const gone = (path: string) => host.finalStatus(path) !== 200;
   const removed = new Set<string>();
   for (const url of previous?.urls ?? []) if (gone(url)) removed.add(url);
@@ -185,7 +215,9 @@ export async function check(options: CheckOptions): Promise<CheckResult> {
   }
 
   // Changed content needs a new updated date.
-  const index: PublishedIndex = { version: 1, origin, pages: {}, urls: files.map((f) => (f === "index.html" ? "/" : f.endsWith("/index.html") ? `/${f.slice(0, -10)}` : `/${f}`)) };
+  // Bundled assets and the host's own config files are not URLs anyone links to.
+  const unlisted = new Set([...built.assets, "_redirects", "_headers"]);
+  const index: PublishedIndex = { version: 2, origin, pages: {}, urls: files.filter((f) => !unlisted.has(f)).map(fileToUrl) };
   for (const p of built.pages) {
     const text = sha1(pages.get(p.file)!.mainText);
     const updated = p.meta.updated instanceof Date ? p.meta.updated.toISOString() : undefined;
@@ -203,7 +235,7 @@ export async function check(options: CheckOptions): Promise<CheckResult> {
       changed: now.filter((u) => previous.pages[u] && previous.pages[u].text !== index.pages[u].text).sort()
     };
   }
-  if (!previous) result.warnings.push({ code: "first-publish", message: "no previous publish recorded here; date-stale and removed-URL checks used the live sitemap only" });
+  if (!previous) result.warnings.push({ code: "first-publish", message: `no ${PUBLISHED_INDEX} yet (publish writes it); date-stale and removed-URL checks used the live sitemap only` });
   result.index = index;
 
   // The site's own checks: report only, so a task that still wants changes is a problem.
@@ -216,11 +248,19 @@ export async function check(options: CheckOptions): Promise<CheckResult> {
   }
 
   if (options.twice) {
+    // Every output file, not just pages: sitemaps, feeds and assets must be reproducible too.
     const outDir = join(".hotpress-cache", "check-twice");
     const again = await build({ root: options.root, configFile: options.configFile, mode: "production", outDir, log: false });
-    const first = new Map(built.pages.map((p) => [p.url, p.hash]));
-    for (const p of again.pages) {
-      if (first.get(p.url) !== p.hash) problems.push({ code: "nondeterministic", url: p.url, message: "two builds of the same checkout produced different HTML" });
+    if (!again.ok) {
+      for (const p of again.problems) problems.push({ ...p, code: "nondeterministic", message: `the second build failed: [${p.code}] ${p.message}` });
+    } else {
+      for (const file of [...new Set([...Object.keys(built.files), ...Object.keys(again.files)])].sort()) {
+        const a = built.files[file];
+        const b = again.files[file];
+        if (a === b) continue;
+        const what = a === undefined ? "only the second build wrote it" : b === undefined ? "only the first build wrote it" : "two builds of the same checkout wrote different bytes";
+        problems.push({ code: "nondeterministic", url: fileToUrl(file), message: what });
+      }
     }
     await rm(join(options.root, outDir), { recursive: true, force: true });
   }

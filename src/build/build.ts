@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, rmdir, stat, writeFile } from "node:fs/promises";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { HotpressError, formatProblems, type Problem } from "../errors.ts";
 import { withPage, type Mode } from "../jsx/context.ts";
 import { render } from "../jsx/runtime.ts";
@@ -39,6 +39,10 @@ export interface BuildResult {
   /** Every source file the build read (for watching). */
   inputs: Set<string>;
   pages: { url: string; file: string; hash: string; meta: Record<string, unknown> }[];
+  /** Every output file (relative to outDir) and its content hash. */
+  files: Record<string, string>;
+  /** Bundled, content-hashed assets (CSS, scripts, their fonts and images): their URLs change with their content. */
+  assets: string[];
   /** The site module's options (for check/publish settings). */
   config?: SiteOptions;
   origin?: string;
@@ -97,6 +101,31 @@ async function readJson<T extends { version: number }>(path: string): Promise<T 
   }
 }
 
+function isInside(path: string, dir: string): boolean {
+  const rel = relative(dir, path);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/**
+ * The out dir is emptied of everything the build didn't write, so it must never hold anything else:
+ * not the site, its sources or public files, and not a folder of someone else's files.
+ */
+async function checkOutDir(root: string, outDir: string, inputs: Iterable<string>, publicDir: string | undefined, written: boolean): Promise<void> {
+  const fail = (message: string): never => {
+    throw new HotpressError({ code: "bad-out-dir", message, hint: "build into a folder of its own, such as dist" });
+  };
+  const rel = relative(root, outDir) || ".";
+  if (isInside(root, outDir)) fail(`the out dir "${rel}" contains the site itself, and the build deletes files it didn't write`);
+  if (isInside(outDir, join(root, ".git"))) fail(`the out dir "${rel}" is inside .git`);
+  if (publicDir && (isInside(publicDir, outDir) || isInside(outDir, publicDir))) fail(`the out dir "${rel}" overlaps the public dir "${relative(root, publicDir)}"`);
+  for (const input of inputs) {
+    if (isInside(input, outDir)) fail(`the out dir "${rel}" contains ${relative(root, input)}, which the build reads`);
+  }
+  if (!written && !isInside(outDir, root) && (await listDir(outDir)).length) {
+    fail(`the out dir "${outDir}" is outside the site, not empty, and wasn't written by a previous build`);
+  }
+}
+
 async function removeEmptyDirs(dir: string, root: string): Promise<void> {
   let entries;
   try {
@@ -117,7 +146,7 @@ export async function build(options: BuildOptions): Promise<BuildResult> {
   const cacheDir = join(root, ".hotpress-cache");
   const state: BundleState = { root, cacheDir, clientScripts: new Set(), inputs: new Set() };
   const mode: Mode = options.mode === "preview" ? "preview" : "build";
-  const result: BuildResult = { ok: false, outDir: "", problems: [], inputs: state.inputs, pages: [], root, durationMs: 0 };
+  const result: BuildResult = { ok: false, outDir: "", problems: [], inputs: state.inputs, pages: [], files: {}, assets: [], root, durationMs: 0 };
 
   try {
     const siteFile = findSiteFile(root, options.configFile);
@@ -129,7 +158,7 @@ export async function build(options: BuildOptions): Promise<BuildResult> {
     if (!/^https?:\/\/[^/]+$/.test(config.origin.replace(/\/+$/, ""))) {
       throw new HotpressError({ code: "bad-origin", message: `origin must be like "https://example.com", got "${config.origin}"`, file: relative(root, siteFile) });
     }
-    const outDir = join(root, options.outDir ?? config.outDir ?? "dist");
+    const outDir = resolve(root, options.outDir ?? config.outDir ?? "dist");
     result.outDir = outDir;
     result.config = config;
     result.origin = config.origin.replace(/\/+$/, "");
@@ -139,7 +168,7 @@ export async function build(options: BuildOptions): Promise<BuildResult> {
       mode,
       root,
       state,
-      loadContext: { root, cacheDir, importMdx: (files, mdx) => importMdxFiles(state, files, mdx) }
+      loadContext: { root, cacheDir, importMdx: (files, mdx) => importMdxFiles(state, files, mdx), track: (file) => void state.inputs.add(file) }
     });
     try {
       await config.build(site);
@@ -198,8 +227,14 @@ export async function build(options: BuildOptions): Promise<BuildResult> {
       if (problems.length) throw new HotpressError(problems);
     }
 
-    const report = await writeOutputs(outDir, cacheDir, outputs, pageHashes, new Set(site.pages.map((p) => p.file)), mode);
+    // One manifest per output directory: it records what is on disk there, and dev builds elsewhere.
+    const manifestPath = join(cacheDir, `build-manifest-${sha1(outDir).slice(0, 12)}.json`);
+    const previous = await readJson<Manifest>(manifestPath);
+    await checkOutDir(root, outDir, state.inputs, publicDir, previous !== undefined);
+    const { report, files } = await writeOutputs(outDir, cacheDir, manifestPath, previous, outputs, pageHashes, new Set(site.pages.map((p) => p.file)), mode);
     result.report = report;
+    result.files = files;
+    result.assets = [...site.assets.keys()].sort();
     result.ok = true;
     result.durationMs = Date.now() - started;
     log(`Built ${plural(site.pages.length, "page")} and ${plural(outputs.size - site.pages.length, "other file")} in ${(result.durationMs / 1000).toFixed(1)}s → ${relative(root, outDir) || "."}`);
@@ -217,15 +252,14 @@ export async function build(options: BuildOptions): Promise<BuildResult> {
 async function writeOutputs(
   outDir: string,
   cacheDir: string,
+  manifestPath: string,
+  previous: Manifest | undefined,
   outputs: Map<string, Output>,
   pageHashes: Record<string, string>,
   pageFiles: Set<string>,
   mode: Mode
-): Promise<ChangeReport> {
-  // One manifest per output directory: it records what is on disk there, and dev builds elsewhere.
-  const manifestPath = join(cacheDir, `build-manifest-${sha1(outDir).slice(0, 12)}.json`);
+): Promise<{ report: ChangeReport; files: Record<string, string> }> {
   const indexPath = join(cacheDir, `pages-${mode}.json`);
-  const previous = await readJson<Manifest>(manifestPath);
   const last = await readJson<PageIndex>(indexPath);
   const files: Record<string, string> = {};
   await mapLimit([...outputs], 64, async ([file, out]) => {
@@ -256,7 +290,15 @@ async function writeOutputs(
       else report.unchanged++;
     }
     for (const url of Object.keys(last.pages)) if (!(url in pageHashes)) report.removed.push(url);
-    const lastPageFiles = new Set(Object.keys(last.pages).map(urlToFile));
+    const lastPageFiles = new Set(
+      Object.keys(last.pages).flatMap((url) => {
+        try {
+          return [urlToFile(url)];
+        } catch {
+          return []; // a URL an older version accepted
+        }
+      })
+    );
     for (const file of new Set([...Object.keys(files), ...Object.keys(last.files)])) {
       if (pageFiles.has(file) || lastPageFiles.has(file)) continue;
       if (files[file] !== last.files[file]) report.files.push(file);
@@ -266,7 +308,7 @@ async function writeOutputs(
   report.added.sort();
   report.removed.sort();
   report.changed.sort();
-  return report;
+  return { report, files };
 }
 
 export function formatChangeReport(r: ChangeReport, max = 10): string {

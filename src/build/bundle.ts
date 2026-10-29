@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import * as esbuild from "esbuild";
 import { HotpressError } from "../errors.ts";
@@ -145,8 +145,9 @@ function bundleError(error: unknown, root: string): HotpressError {
 
 function recordInputs(state: BundleState, meta: esbuild.Metafile): void {
   for (const input of Object.keys(meta.inputs)) {
+    // Keys are relative to the working dir, or absolute behind a plugin namespace ("hotpress-client:/…").
     const path = input.replace(/^[\w-]+:/, "");
-    state.inputs.add(join(state.root, path));
+    state.inputs.add(resolve(state.root, path));
   }
 }
 
@@ -266,6 +267,7 @@ export async function bundleClientScripts(state: BundleState, entries: string[],
   } catch (error) {
     throw bundleError(error, state.root);
   }
+  recordInputs(state, result.metafile!);
   const base = join(state.root, "__hotpress_out__");
   for (const f of result.outputFiles!) files.set(relative(base, f.path).split("\\").join("/"), f.contents);
   for (const [outPath, meta] of Object.entries(result.metafile!.outputs)) {
@@ -282,6 +284,19 @@ export interface AssetOptions {
   minify?: boolean;
 }
 
+/** url(/x.png) and @import "/x.css" in a stylesheet name files the site serves itself (public/): keep them. */
+const rootRelativeUrls: esbuild.Plugin = {
+  name: "hotpress-root-relative",
+  setup(build) {
+    build.onResolve({ filter: /^\// }, (args) => (args.kind === "url-token" || args.kind === "import-rule" ? { path: args.path, external: true } : undefined));
+  }
+};
+
+/** Files a stylesheet references with url() (fonts, images), copied next to it with hashed names. */
+const CSS_FILE_LOADERS: Record<string, esbuild.Loader> = Object.fromEntries(
+  [".woff2", ".woff", ".ttf", ".otf", ".eot", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".svg", ".ico", ".cur"].map((ext) => [ext, "file"])
+);
+
 function outputName(pattern: string, entry: string, contents: Uint8Array): string {
   const name = entry.split("/").pop()!.replace(/\.[^.]+$/, "");
   const hash = createHash("sha256").update(contents).digest("base64url").slice(0, 10);
@@ -293,9 +308,11 @@ export async function bundleCss(
   state: BundleState,
   entry: string,
   options: AssetOptions & { build?: (file: string) => Promise<string> | string }
-): Promise<{ path: string; contents: Uint8Array }> {
+): Promise<{ path: string; contents: Uint8Array; files: Map<string, Uint8Array> }> {
   const file = join(state.root, entry);
   state.inputs.add(file);
+  const pattern = options.output ?? "assets/[name].[hash].css";
+  const files = new Map<string, Uint8Array>();
   let css: Uint8Array;
   if (options.build) {
     let text = await options.build(file);
@@ -309,14 +326,32 @@ export async function bundleCss(
     css = new TextEncoder().encode(text);
   } else {
     try {
-      const result = await esbuild.build({ entryPoints: [file], bundle: true, minify: options.minify ?? true, write: false, logLevel: "silent", absWorkingDir: state.root, outdir: "/out", metafile: true });
+      // Root-relative url()s point at files the site serves itself (public/): leave them alone.
+      // Relative ones are bundled as hashed files beside the stylesheet's own output folder.
+      const dir = dirname(pattern.replace(/^\/+/, ""));
+      const result = await esbuild.build({
+        entryPoints: [file],
+        bundle: true,
+        minify: options.minify ?? true,
+        write: false,
+        logLevel: "silent",
+        absWorkingDir: state.root,
+        outdir: "/out",
+        metafile: true,
+        plugins: [rootRelativeUrls],
+        loader: CSS_FILE_LOADERS,
+        assetNames: `${dir === "." ? "" : `${dir}/`}[name].[hash]`,
+        publicPath: "/"
+      });
       recordInputs(state, result.metafile!);
-      css = result.outputFiles.find((f) => f.path.endsWith(".css"))!.contents;
+      const main = result.outputFiles.find((f) => f.path.endsWith(".css") && dirname(f.path) === "/out")!;
+      css = main.contents;
+      for (const f of result.outputFiles) if (f !== main) files.set(relative("/out", f.path).split("\\").join("/"), f.contents);
     } catch (error) {
       throw bundleError(error, state.root);
     }
   }
-  return { path: outputName(options.output ?? "assets/[name].[hash].css", entry, css), contents: css };
+  return { path: outputName(pattern, entry, css), contents: css, files };
 }
 
 /** Bundle a page-wide script entry (not per component). */

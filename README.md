@@ -21,10 +21,16 @@ rules, ads, analytics) is plain code in your repo, with no plugin system to figh
 ## Quick start
 
 ```bash
-npm install @benchadfield/hotpress
+npm install --save-dev @benchadfield/hotpress typescript @types/node
+npx hotpress init --origin https://example.com
+npm run dev
 ```
 
-`hotpress.site.tsx`:
+`init` writes a small blog that builds and passes `hotpress check` as it is: `hotpress.site.tsx`, a layout
+with the head tags the checks expect (doctype, title, description, canonical), a first post, a stylesheet,
+`tsconfig.json`, `.gitignore` entries and `dev`/`build`/`check` scripts. It never overwrites a file.
+
+A site module that loads Markdown and CSV looks like this:
 
 ```tsx
 import { defineSite, markdown, csv, s, sitemaps, robots, absoluteUrl } from "@benchadfield/hotpress";
@@ -59,8 +65,11 @@ export default defineSite({
 });
 ```
 
-`package.json` scripts: `"dev": "hotpress dev"`, `"build": "hotpress build"`.
+`package.json` scripts: `"dev": "hotpress dev"`, `"build": "hotpress build --check"`.
 `tsconfig.json`: `"jsx": "react-jsx"`, `"jsxImportSource": "@benchadfield/hotpress"`, `"types": ["node", "@benchadfield/hotpress/client"]`.
+
+Stylesheets from `site.css()` bundle the fonts and images they reference with relative `url()`s as hashed
+files; root-relative ones (`url(/img/bg.png)`) are left for `public/` to serve.
 
 ## Content model
 
@@ -90,6 +99,7 @@ Drafts, scheduling, ads and analytics are your code: see `examples/basic` and [A
 
 | | |
 |---|---|
+| `hotpress init [dir] [--origin] [--name]` | Start a new site from a working starter |
 | `hotpress dev [--port] [--third-party]` | Production build into `.hotpress-cache/dev/`, served like the host, rebuilt and reloaded on change. `dist/` is left to `build` |
 | `hotpress build [--check]` | Build to `dist/` and report which pages changed; `--check` also runs every offline check and fails on any problem (use it as the CI build) |
 | `hotpress serve [dir]` | Serve a build like the host |
@@ -98,6 +108,10 @@ Drafts, scheduling, ads and analytics are your code: see `examples/basic` and [A
 | `hotpress diff <a> <b>` | Compare two builds: URLs, metadata, JSON-LD, sitemaps, feeds, redirects, status codes, links |
 
 ## Site tasks
+
+`publish` records what went live in `hotpress.published.json` and commits it with the change. `check`,
+`build --check` and the next `publish` compare with it to catch removed URLs and content changed without
+a new `updated` date, on any clone or CI machine. Commit it; don't edit it by hand.
 
 Sites add their own pre-publish steps with `defineSite({ tasks: [...] })`. A task sees the built pages,
 reports problems during `check`, and may update files during `check --fix` and `publish`. `publish` commits those

@@ -13,10 +13,15 @@ for engine options.** If a site needs something the API doesn't offer, write it 
 4. Rendering is **synchronous**: load and compute data in `build`, then pass it to components as props.
    An `async` component throws.
 
+A new site starts with `npx hotpress init --origin https://example.com`: a working blog to adapt, which passes
+`hotpress check` as it is.
+
 ## Rules that keep sites correct
 
-- **URLs** end in `/` (`/blog/x/` → `blog/x/index.html`) or a file extension (`/404.html`). Duplicates
-  fail the build.
+- **URLs** end in `/` (`/blog/x/` → `blog/x/index.html`) or a file extension (`/404.html`), with no query,
+  fragment, `.`/`..` or empty segments. Duplicates fail the build.
+- **Every page starts with `{raw("<!DOCTYPE html>")}`** in its layout, and indexable pages have a title,
+  meta description and a canonical pointing at themselves. `check` reports `seo` problems otherwise.
 - **Dates are explicit.** Pass `meta.updated` (and `published`) from content or data fields. Never use
   `new Date()` or file mtimes: builds must be deterministic. `hotpress check --twice` proves it.
 - **When a page's main content changes, update its date.** `publish` blocks with `date-stale` otherwise.
@@ -24,6 +29,8 @@ for engine options.** If a site needs something the API doesn't offer, write it 
   materially.
 - **URLs must never disappear silently.** If a page goes, add a redirect (`redirects()` → `_redirects`)
   or explicitly allow `url-removed:/path/`.
+- **`hotpress.published.json` is publish's record of what is live.** `publish` updates and commits it; the
+  checks compare with it on every clone. Commit it, never edit it by hand, never gitignore it.
 - **Escaping**: text and attributes are escaped. Use `raw(html)` only for trusted HTML (rendered
   Markdown is already `Html`). JSON-LD: `<JsonLd data={...} />`.
 - **Third-party scripts** (analytics, ads): render them only when `usePage().mode === "build"`, so local
@@ -83,7 +90,7 @@ npx hotpress publish -m "Add post about X" --all --json
 
 `publish` exits non-zero with `problems: [{ code, message, url?, file?, line?, field?, hint? }]`.
 Codes: `schema`, `transform`, `csv`, `frontmatter`, `compile`, `render`, `site-code`, `duplicate-url`,
-`bad-url`, `link-broken`, `seo`, `url-removed`, `date-stale`, `nondeterministic`, `git-*`,
+`duplicate-slug`, `bad-url`, `bad-out-dir`, `link-broken`, `seo`, `url-removed`, `date-stale`, `nondeterministic`, `git-*`,
 `nothing-to-publish`. Fix the cause and run it again. Known, accepted issues go in the site's
 `check.allow` (`"code:glob"`) with a comment saying why. Don't add them silently.
 

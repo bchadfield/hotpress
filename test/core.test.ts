@@ -8,6 +8,8 @@ import { parseFrontmatter } from "../src/content/frontmatter.ts";
 import { tree, ancestors, paginate, related, groupBy } from "../src/content/helpers.ts";
 import { absoluteUrl, atom, jsonLdString, robots, sitemaps, absolutizeHtml, redirects, headers } from "../src/seo/index.ts";
 import { urlToFile } from "../src/build/site.ts";
+import { StaticHost } from "../src/diff/host.ts";
+import { parseRedirects } from "../src/diff/netlify.ts";
 
 test("jsx escapes text and attributes, keeps raw html", () => {
   const html = render(jsx("p", { title: 'a "b" & c', children: ["<b>x</b>", raw("<i>y</i>")] }));
@@ -117,6 +119,10 @@ test("tree builds nested levels, skips null levels and exposes ancestry", () => 
   assert.equal(t.nodeOf(rows[0]).parent!.entries.length, 2);
 });
 
+test("groupBy lists an item once per key, even if it repeats the key", () => {
+  assert.deepEqual([...groupBy([{ t: ["a", "a", "b"] }], (x) => x.t)].map(([k, v]) => [k, v.length]), [["a", 1], ["b", 1]]);
+});
+
 test("paginate, related and groupBy", () => {
   const pages = paginate([1, 2, 3, 4, 5], 2, (n) => (n === 1 ? "/b/" : `/b/page/${n}/`));
   assert.deepEqual(
@@ -140,6 +146,45 @@ test("URLs map to files and reject ambiguous paths", () => {
   assert.equal(urlToFile("/feed.xml"), "feed.xml");
   assert.throws(() => urlToFile("/about"), /must end with "\/" or a file extension/);
   assert.throws(() => urlToFile("about/"), /must start with/);
+  // Nothing may be written outside the out dir, or to two spellings of one file.
+  assert.throws(() => urlToFile("/../../escape.html"), /"\." or "\.\." segments/);
+  assert.throws(() => urlToFile("/a/./b/"), /segments/);
+  assert.throws(() => urlToFile("/a//b/"), /empty segments/);
+  assert.throws(() => urlToFile("/a/?page=2"), /query or fragment/);
+});
+
+test("Html from another copy of the runtime still renders as markup", () => {
+  const foreign = { value: "<b>x</b>" };
+  Object.defineProperty(foreign, Symbol.for("hotpress.html"), { value: true });
+  assert.equal(render([raw("<i>"), foreign as never, "<"]), "<i><b>x</b>&lt;");
+});
+
+test("schema: impossible dates fail, defaults are per entry, split keeps refinements", () => {
+  assert.equal(validate({ d: s.date() }, { d: "2024-02-30T10:00Z" }).issues.length, 1);
+  assert.equal(validate({ d: s.date() }, { d: "2023-02-29" }).issues.length, 1);
+  assert.equal(validate({ d: s.date() }, { d: "2024-02-29T23:30:00+01:00" }).value.d.toISOString(), "2024-02-29T22:30:00.000Z");
+  const shape = { tags: s.array(s.string()).default([]), when: s.date().default(new Date(0)) };
+  const a = validate(shape, {}).value;
+  const b = validate(shape, {}).value;
+  assert.notEqual(a.tags, b.tags, "each entry gets its own default array");
+  assert.equal(a.when.getTime(), 0);
+  const tags = s.array(s.string()).refine((v) => v.length <= 2, "at most two tags").split("|");
+  assert.deepEqual(validate({ tags }, { tags: "a|b" }).value.tags, ["a", "b"]);
+  assert.equal(validate({ tags }, { tags: "a|b|c" }).issues[0].message, "at most two tags");
+});
+
+test("host: non-3xx redirect rules are rewrites that keep their status", () => {
+  const host = new StaticHost(["blog/404.html", "404.html", "new/index.html"], parseRedirects("/blog/* /blog/404.html 404\n/gone/ /404.html 410\n/old/ /new/ 301\n"));
+  assert.deepEqual(host.resolve("/blog/missing/"), { status: 404, file: "blog/404.html" });
+  assert.deepEqual(host.resolve("/gone/"), { status: 410, file: "404.html" });
+  assert.deepEqual(host.resolve("/old/"), { status: 301, location: "/new/" });
+  assert.equal(host.finalStatus("/old/"), 200);
+});
+
+test("sitemaps: split parts get their own names whatever the index is called", () => {
+  const urls = Array.from({ length: 5 }, (_, i) => ({ loc: `https://x.com/${i}/` }));
+  assert.deepEqual(Object.keys(sitemaps("sitemap", "https://x.com", urls, { maxUrls: 2 })).sort(), ["sitemap", "sitemap-1.xml", "sitemap-2.xml", "sitemap-3.xml"]);
+  assert.throws(() => sitemaps("sitemap.xml", "https://x.com", urls, { maxUrls: 2, partName: () => "part.xml" }), /already uses/);
 });
 
 test("sitemaps: single file, and an index when over the limit", () => {

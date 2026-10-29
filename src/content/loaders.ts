@@ -1,5 +1,5 @@
 import { readdir, readFile } from "node:fs/promises";
-import { basename, extname, join, relative, sep } from "node:path";
+import { extname, join, relative, sep } from "node:path";
 import MarkdownIt from "markdown-it";
 import { HotpressError, type Problem } from "../errors.ts";
 import { raw, type Html } from "../jsx/runtime.ts";
@@ -16,7 +16,8 @@ export interface Entry<T = Record<string, unknown>> {
   body?: Html;
   /** For MDX entries: the compiled component, to render with custom components. */
   Content?: (props?: Record<string, unknown>) => Html;
-  source: { file: string; line?: number };
+  /** Where the entry came from: a file, plus the line (CSV) or array index (JSON) of its record. */
+  source: { file: string; line?: number; index?: number };
 }
 
 export interface LoadContext {
@@ -27,6 +28,8 @@ export interface LoadContext {
     files: string[],
     options?: MdxCompileOptions
   ): Promise<Map<string, { default: (props?: Record<string, unknown>) => unknown; frontmatter?: unknown }>>;
+  /** Record a source file the build read (so the out dir can never contain it). */
+  track(file: string): void;
 }
 
 export interface Loader<T> {
@@ -41,12 +44,19 @@ type Out<S, Fallback> = S extends ObjectField<infer X> ? Infer<X> : S extends Sh
 export interface CommonOptions<S extends SchemaInput | undefined, T> {
   schema?: S;
   /** Derive or reshape fields after validation. Throw to fail the build for this entry. */
-  transform?: (data: Out<S, Record<string, unknown>>, info: { id: string; file: string; line?: number }) => T;
+  transform?: (data: Out<S, Record<string, unknown>>, info: { id: string; file: string; line?: number; index?: number }) => T;
   /** Field that holds the slug (default "slug"); falls back to the id's last segment. */
   slugField?: string;
 }
 
 const DATE_PREFIX = /^\d{4}-\d{2}-\d{2}-/;
+
+/** "posts/2024-01-10-hello" -> "hello"; "guides/setup/index" -> "setup" (a folder per entry). */
+function idSlug(id: string): string {
+  const parts = id.split("/");
+  const name = parts.length > 1 && parts[parts.length - 1] === "index" ? parts[parts.length - 2] : parts[parts.length - 1];
+  return name.replace(DATE_PREFIX, "");
+}
 
 function toPosix(path: string): string {
   return path.split(sep).join("/");
@@ -74,7 +84,7 @@ async function walk(dir: string, exts: string[]): Promise<string[]> {
 
 function finish<T>(
   kind: string,
-  rows: { id: string; file: string; line?: number; data: Record<string, unknown>; extra?: Partial<Entry<T>> }[],
+  rows: { id: string; file: string; line?: number; index?: number; data: Record<string, unknown>; extra?: Partial<Entry<T>> }[],
   options: CommonOptions<SchemaInput | undefined, T>
 ): Entry<T>[] {
   const problems: Problem[] = [];
@@ -82,11 +92,13 @@ function finish<T>(
   const slugs = new Map<string, string>();
   for (const row of rows) {
     const where = { file: row.file, line: row.line };
+    // JSON records have no line numbers: name the record by its index in the field path instead.
+    const at = (field: string) => (row.index === undefined ? field : field ? `[${row.index}].${field}` : `[${row.index}]`);
     let data: Record<string, unknown> = row.data;
     if (options.schema) {
       const { value, issues } = validate(options.schema as Shape, row.data);
       if (issues.length) {
-        problems.push(...issues.map((i: Issue) => ({ code: "schema", message: i.message, field: i.path, ...where })));
+        problems.push(...issues.map((i: Issue) => ({ code: "schema", message: i.message, field: at(i.path), ...where })));
         continue;
       }
       data = value as Record<string, unknown>;
@@ -94,22 +106,22 @@ function finish<T>(
     let final: unknown = data;
     if (options.transform) {
       try {
-        final = options.transform(data as never, { id: row.id, ...where });
+        final = options.transform(data as never, { id: row.id, ...where, index: row.index });
       } catch (error) {
-        problems.push({ code: "transform", message: (error as Error).message, ...where });
+        problems.push({ code: "transform", message: (error as Error).message, ...where, ...(row.index === undefined ? {} : { field: at("") }) });
         continue;
       }
     }
     const slugField = options.slugField ?? "slug";
     const fromData = (final as Record<string, unknown>)?.[slugField];
-    const slug = typeof fromData === "string" && fromData ? fromData : basename(row.id).replace(DATE_PREFIX, "");
+    const slug = typeof fromData === "string" && fromData ? fromData : idSlug(row.id);
     const clash = slugs.get(slug);
     if (clash) {
-      problems.push({ code: "duplicate-slug", message: `slug "${slug}" is also used by ${clash}`, ...where });
+      problems.push({ code: "duplicate-slug", message: `slug "${slug}" is also used by ${clash}`, ...where, ...(row.index === undefined ? {} : { field: at("") }) });
       continue;
     }
-    slugs.set(slug, row.line ? `${row.file}:${row.line}` : row.file);
-    entries.push({ id: row.id, slug, data: final as T, source: where, ...row.extra });
+    slugs.set(slug, row.line ? `${row.file}:${row.line}` : row.index !== undefined ? `${row.file} ${at("")}` : row.file);
+    entries.push({ id: row.id, slug, data: final as T, source: row.index === undefined ? where : { file: row.file, index: row.index }, ...row.extra });
   }
   if (problems.length) throw new HotpressError(problems);
   return entries;
@@ -140,6 +152,7 @@ export function markdown<S extends SchemaInput | undefined = undefined, T = Out<
       for (const full of files) {
         const file = toPosix(relative(ctx.root, full));
         const id = toPosix(relative(join(ctx.root, dir), full)).replace(/\.[^.]+$/, "");
+        ctx.track(full);
         try {
           const fm = parseFrontmatter(await readFile(full, "utf8"));
           rows.push({ id, file, data: fm.data, body: fm.body });
@@ -226,6 +239,7 @@ export function csv<S extends SchemaInput | undefined = undefined, T = Out<S, Re
     describe: file,
     async load(ctx) {
       let parsed;
+      ctx.track(join(ctx.root, file));
       try {
         parsed = parseCsv(await readFile(join(ctx.root, file), "utf8"), { trim: options.trim });
       } catch (error) {
@@ -256,6 +270,7 @@ export function json<S extends SchemaInput | undefined = undefined, T = Out<S, R
     describe: file,
     async load(ctx) {
       let doc: unknown;
+      ctx.track(join(ctx.root, file));
       try {
         doc = JSON.parse(await readFile(join(ctx.root, file), "utf8"));
       } catch (error) {
@@ -266,7 +281,7 @@ export function json<S extends SchemaInput | undefined = undefined, T = Out<S, R
       const rows = list.map((item, i) => ({
         id: String((item as Record<string, unknown>)?.[options.slugField ?? "slug"] ?? i + 1),
         file,
-        line: i + 1,
+        index: i,
         data: item as Record<string, unknown>
       }));
       return finish("json", rows, options as CommonOptions<SchemaInput | undefined, T>);

@@ -41,7 +41,11 @@ export abstract class Field<T> {
   parse(value: unknown, path: string, issues: Issue[]): T {
     if (isEmpty(value)) {
       if (this.defaultValue !== MISSING) {
-        return (typeof this.defaultValue === "function" ? (this.defaultValue as () => T)() : this.defaultValue) as T;
+        if (typeof this.defaultValue === "function") return (this.defaultValue as () => T)();
+        // Each entry gets its own copy: a shared default array would change for every entry at once.
+        const d = this.defaultValue;
+        const plain = Array.isArray(d) || (typeof d === "object" && d !== null && Object.getPrototypeOf(d) === Object.prototype);
+        return (plain ? structuredClone(d) : d) as T;
       }
       if (this.isOptional) return undefined as T;
       issues.push({ path, message: `required ${this.kind} is missing` });
@@ -154,8 +158,11 @@ class DateField extends Field<Date> {
       const v = value.trim();
       // Only ISO 8601 forms: "2024-01-31", "2024-01-31T10:00:00Z", with offsets. Bare dates are UTC.
       if (/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/.test(v)) {
+        // Date rolls 2024-02-30 over to 1 March: check the calendar date as written.
+        const [year, month, day] = v.slice(0, 10).split("-").map(Number);
+        const real = month >= 1 && month <= 12 && day >= 1 && day <= new Date(Date.UTC(year, month, 0)).getUTCDate();
         const d = new Date(v.length === 10 ? `${v}T00:00:00Z` : v.replace(" ", "T"));
-        if (!Number.isNaN(d.getTime()) && (v.length !== 10 || d.toISOString().slice(0, 10) === v)) return d;
+        if (real && !Number.isNaN(d.getTime())) return d;
       }
     }
     return this.fail(issues, path, value);
@@ -187,8 +194,10 @@ class ArrayField<T> extends Field<T[]> {
     this.kind = `list of ${item.kind}`;
   }
   /** Accept a delimited string too, for CSV columns ("a|b|c"). */
-  split(separator: string): ArrayField<T> {
-    return new ArrayField(this.item, separator);
+  split(separator: string): this {
+    const copy = this.clone();
+    copy.separator = separator;
+    return copy;
   }
   protected coerce(value: unknown, path: string, issues: Issue[]) {
     let list = value;
@@ -238,6 +247,12 @@ class AnyField<T> extends Field<T> {
   }
 }
 
+// Duck-typed rather than instanceof, so a schema built with another copy of the package still works.
+function isObjectField<S extends Shape>(value: S | ObjectField<S>): value is ObjectField<S> {
+  const v = value as { kind?: unknown; shape?: unknown; parse?: unknown };
+  return v.kind === "object" && typeof v.parse === "function" && typeof v.shape === "object";
+}
+
 function join(path: string, key: string): string {
   return path ? `${path}.${key}` : key;
 }
@@ -258,7 +273,7 @@ export type { ObjectField };
 
 /** Validate a record against a shape; returns the parsed value and any issues. */
 export function validate<S extends Shape>(shape: S | ObjectField<S>, value: unknown, path = ""): { value: Infer<S>; issues: Issue[] } {
-  const field = shape instanceof ObjectField ? shape : new ObjectField(shape);
+  const field = isObjectField(shape) ? shape : new ObjectField(shape as S);
   const issues: Issue[] = [];
   const parsed = field.parse(value ?? {}, path, issues);
   return { value: parsed, issues };

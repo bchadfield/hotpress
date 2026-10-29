@@ -1,14 +1,14 @@
 // `hotpress publish`: commit, build exactly that commit in a clean worktree, check it, push.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { rm, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { HotpressError, type Problem } from "../errors.ts";
 import { importSiteModule } from "../build/bundle.ts";
 import { findSiteFile } from "../build/build.ts";
 import type { SiteOptions } from "../build/site.ts";
-import { check, writePublishedIndex, type CheckResult } from "./check.ts";
+import { check, formatPublishedIndex, PUBLISHED_INDEX, type CheckResult } from "./check.ts";
 
 export interface PublishOptions {
   root: string;
@@ -42,15 +42,18 @@ function git(cwd: string, args: string[], allowFail = false): string {
   }
 }
 
-async function siteSettings(root: string, configFile?: string): Promise<SiteOptions["check"]> {
+async function siteConfig(root: string, configFile?: string): Promise<Partial<SiteOptions>> {
   const mod = await importSiteModule({ root, cacheDir: join(root, ".hotpress-cache"), clientScripts: new Set(), inputs: new Set() }, findSiteFile(root, configFile));
-  return (mod.default as SiteOptions | undefined)?.check ?? {};
+  return (mod.default as SiteOptions | undefined) ?? {};
 }
 
 export async function publish(options: PublishOptions): Promise<PublishResult> {
   const log = options.log === false ? () => {} : (m: string) => process.stdout.write(m + "\n");
   const root = git(options.root, ["rev-parse", "--show-toplevel"]);
-  const settings = (await siteSettings(options.root, options.configFile)) ?? {};
+  // git prints the real path; options.root may reach the same folder through a symlink.
+  const siteRel = relative(root, realpathSync(options.root)).split("\\").join("/");
+  const config = await siteConfig(options.root, options.configFile);
+  const settings = config.check ?? {};
   const branch = settings.branch ?? "main";
   const remote = settings.remote ?? "origin";
   const fail = (problems: Problem[]): PublishResult => {
@@ -61,8 +64,9 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
   // 1. Git preflight.
   const current = git(root, ["rev-parse", "--abbrev-ref", "HEAD"]);
   if (current !== branch) return fail([{ code: "git-branch", message: `on branch "${current}", but publishing happens from "${branch}"`, hint: `git switch ${branch}` }]);
-  const tracked = git(root, ["ls-files", "--", "dist", ".hotpress-cache"]);
-  if (tracked) return fail([{ code: "git-tracked-output", message: "build output is tracked by git", hint: "git rm -r --cached dist .hotpress-cache and add them to .gitignore" }]);
+  const outputs = [config.outDir ?? "dist", ".hotpress-cache"].map((dir) => (siteRel ? `${siteRel}/${dir}` : dir));
+  const tracked = git(root, ["ls-files", "--", ...outputs]);
+  if (tracked) return fail([{ code: "git-tracked-output", message: "build output is tracked by git", hint: `git rm -r --cached ${outputs.join(" ")} and add them to .gitignore` }]);
   const hasRemote = git(root, ["remote"]).split("\n").includes(remote);
   if (!hasRemote) return fail([{ code: "git-remote", message: `no git remote named "${remote}"` }]);
   if (!options.offline) git(root, ["fetch", "--quiet", remote, branch]);
@@ -91,7 +95,6 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
   const undo = () => {
     if (committed) git(root, ["reset", "--soft", "HEAD~1"]);
   };
-  const siteRel = options.root === root ? "" : options.root.slice(root.length + 1);
 
   // 3. Build that exact commit in a clean worktree, so forgotten or ignored files show up as failures.
   const checkCommit = async (sha: string, fix: boolean): Promise<{ result: CheckResult; fixed: Map<string, Buffer> }> => {
@@ -108,7 +111,8 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
         await symlink(join(options.root, "node_modules"), join(siteRoot, "node_modules"), "dir");
       } else if (existsSync(lockThere)) {
         log("package-lock.json differs from the installed packages: running npm ci in the publish worktree");
-        execFileSync("npm", ["ci", "--no-audit", "--no-fund"], { cwd: siteRoot, stdio: "inherit" });
+        // npm's output goes to stderr: stdout may be carrying --json for an agent.
+        execFileSync("npm", ["ci", "--no-audit", "--no-fund"], { cwd: siteRoot, stdio: ["ignore", 2, 2] });
       }
       const result = await check({
         root: siteRoot,
@@ -117,7 +121,7 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
         offline: options.offline,
         twice: options.twice,
         fix,
-        publishedIndex: join(options.root, ".hotpress-cache", "published.json"),
+        legacyIndex: join(options.root, ".hotpress-cache", "published.json"),
         log: options.log
       });
       const fixed = new Map(result.fixed.map((file) => [file, readFileSync(join(siteRoot, file))]));
@@ -164,9 +168,36 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
     return { ok: true, pushed: false, commit, problems: [], check: result };
   }
 
-  // 4. Push and remember what is now live.
-  git(root, ["push", "--quiet", remote, `HEAD:${branch}`]);
-  await writePublishedIndex(join(options.root, ".hotpress-cache", "published.json"), result.index!);
+  // 4. Record what is now live in the commit itself, so every clone checks against it. The build doesn't
+  // read the index, so the checked output is unchanged.
+  const indexFile = join(options.root, PUBLISHED_INDEX);
+  const indexText = formatPublishedIndex(result.index!);
+  if (!existsSync(indexFile) || readFileSync(indexFile, "utf8") !== indexText) {
+    await writeFile(indexFile, indexText);
+    git(root, ["add", "--", siteRel ? `${siteRel}/${PUBLISHED_INDEX}` : PUBLISHED_INDEX]);
+    if (committed) git(root, ["commit", "--quiet", "--amend", "--no-edit"]);
+    else {
+      git(root, ["commit", "--quiet", "-m", `Update ${PUBLISHED_INDEX}`]);
+      committed = true;
+    }
+    commit = git(root, ["rev-parse", "HEAD"]);
+  }
+
+  // 5. Push.
+  try {
+    git(root, ["push", "--quiet", remote, `HEAD:${branch}`]);
+  } catch (error) {
+    undo();
+    // The index must keep describing what is live, or the next publish compares with a publish that never happened.
+    const indexPath = siteRel ? `${siteRel}/${PUBLISHED_INDEX}` : PUBLISHED_INDEX;
+    if (git(root, ["ls-tree", "--name-only", "HEAD", "--", indexPath], true)) git(root, ["checkout", "HEAD", "--", indexPath]);
+    else {
+      git(root, ["rm", "--quiet", "--cached", "--ignore-unmatch", "--", indexPath], true);
+      await rm(indexFile, { force: true });
+    }
+    const problem = (error as HotpressError).problems?.[0] ?? { code: "git", message: String(error) };
+    return fail([{ ...problem, code: "git-push", hint: `nothing was published${committed ? "; your commit was undone (changes are still staged)" : ""}. Fix the push problem, then publish again` }]);
+  }
   log(`Published ${commit.slice(0, 7)} to ${remote}/${branch}. The host builds and deploys it from there.`);
   if (result.fixed.length) log(`Included updates from site tasks: ${result.fixed.join(", ")}`);
   const c = result.changes;

@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { watch, type FSWatcher } from "node:fs";
+import { readdirSync, statSync, watch, type FSWatcher } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { extname, join, relative, sep } from "node:path";
+import { extname, join, relative } from "node:path";
 import type { Duplex } from "node:stream";
 import { build } from "../build/build.ts";
 import { formatProblems } from "../errors.ts";
@@ -106,8 +106,8 @@ export async function serve(options: ServeOptions): Promise<Server> {
     if (resolved.status < 400) for (const rule of headerRules) if (headerMatches(rule, url.pathname)) for (const [k, v] of rule.values) headers[k] = v;
     if (options.liveReload) headers["cache-control"] = "no-store";
     if (!resolved.file) {
-      res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-      res.end("Not found (and no 404.html in the build)");
+      res.writeHead(resolved.status, { "content-type": "text/plain; charset=utf-8" });
+      res.end(resolved.status === 404 ? "Not found (and no 404.html in the build)" : `${resolved.status}`);
       return;
     }
     let body: Buffer;
@@ -186,7 +186,41 @@ export interface DevServer {
  */
 export const DEV_OUT_DIR = join(".hotpress-cache", "dev");
 
-const IGNORED = /(^|[/\\])(node_modules|\.git|\.hotpress-cache|dist)([/\\]|$)/;
+/** Top-level folders that never hold site sources. */
+const IGNORED = new Set(["node_modules", "dist", ".hotpress-cache"]);
+
+/**
+ * Watch the site's sources: the root's own files plus each top-level folder, recursively, except
+ * dot-folders, node_modules and build output. One recursive watch on the root would add an inotify watch
+ * for every folder in node_modules on Linux.
+ */
+function watchSources(root: string, ignored: Set<string>, onChange: () => void): () => void {
+  const watchers = new Map<string, FSWatcher>();
+  const skip = (name: string) => name.startsWith(".") || ignored.has(name);
+  const watchDir = (name: string) => {
+    if (watchers.has(name) || skip(name)) return;
+    try {
+      if (!statSync(join(root, name)).isDirectory()) return;
+      const w = watch(join(root, name), { recursive: true }, onChange);
+      w.on("error", () => {
+        w.close();
+        watchers.delete(name);
+      });
+      watchers.set(name, w);
+    } catch {}
+  };
+  const top = watch(root, (_event, filename) => {
+    const name = filename?.toString();
+    if (!name || skip(name)) return;
+    watchDir(name); // a new folder
+    onChange();
+  });
+  for (const name of readdirSync(root)) watchDir(name);
+  return () => {
+    top.close();
+    for (const w of watchers.values()) w.close();
+  };
+}
 
 /** Production build + host-accurate preview + rebuild and reload on change, until closed. */
 export async function startDev(options: DevOptions): Promise<DevServer> {
@@ -220,8 +254,9 @@ export async function startDev(options: DevOptions): Promise<DevServer> {
     }
   };
 
-  const watcher: FSWatcher = watch(options.root, { recursive: true }, (_event, filename) => {
-    if (!filename || IGNORED.test(filename.toString().split(sep).join("/"))) return;
+  // A configured outDir (where `build` writes) must not trigger dev rebuilds either.
+  const ignored = new Set([...IGNORED, relative(options.root, join(options.root, first.config?.outDir ?? "dist")).split(/[/\\]/)[0]]);
+  const stopWatching = watchSources(options.root, ignored, () => {
     clearTimeout(timer);
     timer = setTimeout(rebuild, 80);
   });
@@ -230,7 +265,7 @@ export async function startDev(options: DevOptions): Promise<DevServer> {
     outDir,
     async close() {
       clearTimeout(timer);
-      watcher.close();
+      stopWatching();
       await server.close();
     }
   };

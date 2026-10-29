@@ -16,19 +16,22 @@ export interface PageContext {
   scripts: Set<string>;
 }
 
-let current: PageContext | undefined;
+// Kept on globalThis so every copy of this module (the CLI's and the site's) sees the same page.
+const KEY = Symbol.for("hotpress.page");
+const slot = globalThis as unknown as Record<symbol, PageContext | undefined>;
 
 export function usePage(): PageContext {
+  const current = slot[KEY];
   if (!current) throw new Error("usePage() can only be called while a page is rendering (inside a site.page() render function).");
   return current;
 }
 
 export function withPage<T>(ctx: PageContext, fn: () => T): T {
-  const previous = current;
-  current = ctx;
+  const previous = slot[KEY];
+  slot[KEY] = ctx;
   try {
     return fn();
   } finally {
-    current = previous;
+    slot[KEY] = previous;
   }
 }

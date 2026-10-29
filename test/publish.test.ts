@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { publish } from "../src/publish/publish.ts";
@@ -50,6 +50,7 @@ test("publish commits, builds the commit, checks and pushes", async () => {
 test("content changed without a new updated date is blocked, and the commit is undone", async () => {
   const { dir, remote } = await repo();
   const before = remoteHead(remote);
+  const head = git(dir, "rev-parse", "HEAD");
   const post = join(dir, "content/posts/2024-02-01-second-post.md");
   await writeFile(post, (await readFile(post, "utf8")).replace("Some text", "Some changed text"));
   const result = await publish({ root: dir, all: true, message: "Edit without date", offline: true, log: false });
@@ -59,7 +60,7 @@ test("content changed without a new updated date is blocked, and the commit is u
     ["date-stale /blog/second-post/"]
   );
   assert.equal(remoteHead(remote), before, "nothing pushed");
-  assert.equal(git(dir, "log", "-1", "--format=%s"), "Initial site", "commit undone");
+  assert.equal(git(dir, "rev-parse", "HEAD"), head, "commit undone");
   assert.match(git(dir, "diff", "--cached", "--name-only"), /second-post\.md/, "changes still staged");
 });
 
@@ -188,4 +189,95 @@ test("build --check fails the build while a site task reports a problem", async 
   assert.match(stale.out, /Build stopped/);
   await check({ root: dir, offline: true, log: false, fix: true, today: "2026-11-01" });
   assert.equal(run().code, 0);
+});
+
+test("a CSS-only change publishes, and the published index is committed without bundled assets", async () => {
+  const { dir, remote } = await repo();
+  const index = JSON.parse(git(remote, "show", "main:hotpress.published.json"));
+  assert.equal(index.version, 2);
+  assert.ok(index.urls.includes("/blog/hello-world/") && index.urls.includes("/favicon.svg"));
+  assert.equal(index.urls.some((u: string) => u.startsWith("/assets/") || u === "/_headers"), false, "hashed assets are not tracked URLs");
+  await writeFile(join(dir, "styles/main.css"), (await readFile(join(dir, "styles/main.css"), "utf8")) + "h1 { color: red; }\n");
+  const result = await publish({ root: dir, all: true, message: "Tweak CSS", offline: true, log: false });
+  assert.equal(result.ok, true, JSON.stringify(result.problems));
+  assert.equal(git(dir, "status", "--porcelain"), "");
+});
+
+test("a fresh clone checks against the committed index, not a local cache", async () => {
+  const { dir, remote } = await repo();
+  const clone = join(dir, "..", "clone");
+  git(join(dir, ".."), "clone", "--quiet", remote, clone);
+  await rm(join(clone, "content/posts/2024-01-10-hello-world.md"));
+  const result = await check({ root: clone, offline: true, log: false });
+  assert.ok(result.problems.some((p) => p.code === "url-removed" && p.url === "/blog/hello-world/"), JSON.stringify(result.problems));
+  assert.equal(result.warnings.some((w) => w.code === "first-publish"), false);
+});
+
+test("an older local index (listing assets) still works, without flagging old assets", async () => {
+  await mkdir(TMP, { recursive: true });
+  const dir = await mkdtemp(join(TMP, "legacy-"));
+  await cp(EXAMPLE, dir, { recursive: true, filter: (src) => !/[/\\](dist|\.hotpress-cache)([/\\]|$)/.test(src) });
+  await mkdir(join(dir, ".hotpress-cache"), { recursive: true });
+  const legacy = { version: 1, origin: "https://example.com", pages: {}, urls: ["/", "/assets/main.K2BRTKB97q.css", "/assets/js/filter.ABCDEFGH.js", "/old-page/"] };
+  await writeFile(join(dir, ".hotpress-cache/published.json"), JSON.stringify(legacy));
+  const result = await check({ root: dir, offline: true, log: false });
+  assert.deepEqual(result.problems.map((p) => `${p.code} ${p.url}`), ["url-removed /old-page/"]);
+});
+
+test("check --twice compares every output file and fails if the second build fails", async () => {
+  await mkdir(TMP, { recursive: true });
+  const site = async (code: string) => {
+    const dir = await mkdtemp(join(TMP, "twice-"));
+    await cp(EXAMPLE, dir, { recursive: true, filter: (src) => !/[/\\](dist|\.hotpress-cache)([/\\]|$)/.test(src) });
+    const sitePath = join(dir, "hotpress.site.tsx");
+    await writeFile(sitePath, (await readFile(sitePath, "utf8")).replace("async build(site) {", `async build(site) {\n    ${code}`));
+    return dir;
+  };
+  const random = await check({ root: await site('site.file("build-id.txt", String(Math.random()));'), twice: true, offline: true, log: false });
+  assert.deepEqual(random.problems.map((p) => `${p.code} ${p.url}`), ["nondeterministic /build-id.txt"]);
+  const flaky = await check({ root: await site('const g = globalThis as any; g.__flaky = (g.__flaky ?? 0) + 1; if (g.__flaky === 2) throw new Error("second time");'), twice: true, offline: true, log: false });
+  assert.equal(flaky.ok, false);
+  assert.match(flaky.problems[0].message, /second build failed: \[site-code\] second time/);
+});
+
+test("a failed push undoes the commit and leaves the published index as it was", async () => {
+  const { dir, remote } = await repo();
+  const before = remoteHead(remote);
+  const head = git(dir, "rev-parse", "HEAD");
+  await writeFile(join(remote, "hooks/pre-receive"), "#!/bin/sh\necho rejected >&2\nexit 1\n", { mode: 0o755 });
+  const post = join(dir, "content/posts/2024-02-01-second-post.md");
+  await writeFile(post, (await readFile(post, "utf8")).replace("updated: 2024-02-03", "updated: 2024-03-01").replace("Some text", "Some new text"));
+  const result = await publish({ root: dir, all: true, message: "Edit", offline: true, log: false });
+  assert.equal(result.ok, false);
+  assert.equal(result.problems[0].code, "git-push");
+  assert.equal(remoteHead(remote), before);
+  assert.equal(git(dir, "rev-parse", "HEAD"), head, "commit undone");
+  assert.equal(git(dir, "status", "--porcelain"), "M  content/posts/2024-02-01-second-post.md", "only the change is left, staged");
+});
+
+test("init starts a site that builds and passes every check", async () => {
+  await mkdir(TMP, { recursive: true });
+  const dir = await mkdtemp(join(TMP, "init-"));
+  await writeFile(join(dir, ".gitignore"), "/node_modules\n");
+  const { init } = await import("../src/init.ts");
+  const created = await init({ root: dir, origin: "https://blog.example.org", name: "My Blog", today: "2026-10-29", log: false });
+  assert.deepEqual(created.created.sort(), ["content/posts/hello-world.md", "hotpress.site.tsx", "package.json", "src/Layout.tsx", "styles/main.css", "tsconfig.json"]);
+  assert.equal(await readFile(join(dir, ".gitignore"), "utf8"), "/node_modules\ndist/\n.hotpress-cache/\n");
+  // Its own package.json hides this checkout from self-reference: install it the way npm would.
+  await mkdir(join(dir, "node_modules/@benchadfield"), { recursive: true });
+  await symlink(new URL("..", import.meta.url).pathname, join(dir, "node_modules/@benchadfield/hotpress"), "dir");
+  const result = await check({ root: dir, offline: true, log: false });
+  assert.equal(result.ok, true, JSON.stringify(result.problems));
+  assert.deepEqual(result.build!.pages.map((p) => p.url), ["/blog/hello-world/", "/", "/404.html"]);
+  await assert.rejects(init({ root: dir, log: false }), /already exists/);
+});
+
+test("pages without a doctype fail the SEO check", async () => {
+  await mkdir(TMP, { recursive: true });
+  const dir = await mkdtemp(join(TMP, "doctype-"));
+  await cp(EXAMPLE, dir, { recursive: true, filter: (src) => !/[/\\](dist|\.hotpress-cache)([/\\]|$)/.test(src) });
+  const layout = join(dir, "src/Layout.tsx");
+  await writeFile(layout, (await readFile(layout, "utf8")).replace('{raw("<!DOCTYPE html>")}', ""));
+  const result = await check({ root: dir, offline: true, log: false });
+  assert.ok(result.problems.length > 0 && result.problems.every((p) => p.code === "seo" && p.field === "doctype"), JSON.stringify(result.problems));
 });

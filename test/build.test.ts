@@ -159,3 +159,74 @@ test("module-level state in site code does not survive into the next build", asy
   await build({ root: dir, log: false });
   assert.equal(await read(dir, "first-title.txt"), "Hello again");
 });
+
+test("the out dir can never be the site, hold its sources, or be someone else's folder", async () => {
+  const dir = await copyExample();
+  for (const [outDir, message] of [
+    [".", /contains the site itself/],
+    ["..", /contains the site itself/],
+    ["content", /contains content\/posts\/.+, which the build reads/],
+    ["public", /overlaps the public dir/]
+  ] as const) {
+    const result = await build({ root: dir, outDir, log: false });
+    assert.equal(result.ok, false, outDir);
+    assert.equal(result.problems[0].code, "bad-out-dir");
+    assert.match(result.problems[0].message, message);
+  }
+  assert.ok(existsSync(join(dir, "hotpress.site.tsx")) && existsSync(join(dir, "content/posts")), "nothing was deleted");
+  // A non-empty folder outside the site that no build wrote is left alone.
+  const elsewhere = await mkdtemp(join(TMP, "elsewhere-"));
+  await writeFile(join(elsewhere, "notes.txt"), "mine");
+  const outside = await build({ root: dir, outDir: elsewhere, log: false });
+  assert.equal(outside.problems[0]?.code, "bad-out-dir");
+  assert.equal(await readFile(join(elsewhere, "notes.txt"), "utf8"), "mine");
+  await rm(elsewhere, { recursive: true });
+});
+
+test("file paths cannot leave the out dir", async () => {
+  const dir = await copyExample();
+  const sitePath = join(dir, "hotpress.site.tsx");
+  await writeFile(sitePath, (await readFile(sitePath, "utf8")).replace('site.file("robots.txt"', 'site.file("../escape.txt", "x");\n    site.file("robots.txt"'));
+  const result = await build({ root: dir, log: false });
+  assert.deepEqual(result.problems.map((p) => p.code), ["bad-url"]);
+  assert.equal(existsSync(join(dir, "escape.txt")), false);
+});
+
+test("stylesheets bundle the fonts and images they reference; root-relative urls are left alone", async () => {
+  const dir = await copyExample();
+  await mkdir(join(dir, "styles/fonts"), { recursive: true });
+  await writeFile(join(dir, "styles/fonts/body.woff2"), "font");
+  await writeFile(join(dir, "styles/main.css"), "@font-face{font-family:b;src:url(./fonts/body.woff2)}\nbody{background:url(/favicon.svg)}\n");
+  const result = await build({ root: dir, log: false });
+  assert.equal(result.ok, true, JSON.stringify(result.problems));
+  const font = result.assets.find((f) => f.endsWith(".woff2"))!;
+  assert.match(font, /^assets\/body\.[A-Z0-9]+\.woff2$/);
+  assert.equal(await read(dir, font), "font");
+  const css = await read(dir, result.assets.find((f) => f.endsWith(".css"))!);
+  assert.ok(css.includes(`"/${font}"`) && css.includes("url(/favicon.svg)"), css);
+});
+
+test("nested index files take their folder's slug; JSON problems name the record", async () => {
+  const dir = await copyExample();
+  await mkdir(join(dir, "content/guides/setup"), { recursive: true });
+  await mkdir(join(dir, "content/guides/deploy"), { recursive: true });
+  await writeFile(join(dir, "content/guides/setup/index.md"), "---\ntitle: Setup\n---\nx\n");
+  await writeFile(join(dir, "content/guides/deploy/index.md"), "---\ntitle: Deploy\n---\nx\n");
+  await writeFile(join(dir, "data/items.json"), JSON.stringify([{ slug: "a", n: 1 }, { slug: "b", n: "many" }]));
+  const sitePath = join(dir, "hotpress.site.tsx");
+  await writeFile(
+    sitePath,
+    (await readFile(sitePath, "utf8")).replace(
+      'site.page("/404.html"',
+      `const guides = await site.load(markdown("content/guides"));
+    site.file("guides.txt", guides.map((g) => g.slug).join(","));
+    await site.load(json("data/items.json", { schema: { slug: s.slug(), n: s.number() } }));
+    site.page("/404.html"`
+    ).replace("import { absoluteUrl,", "import { json, absoluteUrl,")
+  );
+  const result = await build({ root: dir, log: false });
+  assert.deepEqual(result.problems.map((p) => `${p.code} ${p.file} ${p.line} ${p.field}`), ["schema data/items.json undefined [1].n"]);
+  await writeFile(join(dir, "data/items.json"), JSON.stringify([{ slug: "a", n: 1 }]));
+  assert.equal((await build({ root: dir, log: false })).ok, true);
+  assert.equal(await read(dir, "guides.txt"), "deploy,setup");
+});

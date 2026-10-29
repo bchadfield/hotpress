@@ -1,15 +1,24 @@
 // A JSX runtime that renders straight to HTML strings. No virtual DOM: jsx() returns an Html value
 // holding escaped markup, so rendering a page is a chain of synchronous function calls.
 
+// Html is recognised by a global brand, not instanceof: the CLI and a site can load different copies of
+// this module (a global install, npm link), and markup from one must still render in the other.
+const HTML = Symbol.for("hotpress.html");
+
 export class Html {
   readonly value: string;
+  declare readonly [HTML]: true;
   constructor(value: string) {
     this.value = value;
   }
   toString(): string {
     return this.value;
   }
+  static [Symbol.hasInstance](value: unknown): boolean {
+    return typeof value === "object" && value !== null && (value as Record<symbol, unknown>)[HTML] === true;
+  }
 }
+Object.defineProperty(Html.prototype, HTML, { value: true });
 
 export type Child = Html | string | number | bigint | boolean | null | undefined | Child[];
 export type Component<P = Record<string, unknown>> = (props: P) => Child;

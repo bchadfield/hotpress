@@ -139,7 +139,8 @@ export function groupBy<T>(items: T[], values: (x: T) => string | readonly strin
   const out = new Map<string, T[]>();
   for (const item of items) {
     const v = values(item);
-    for (const key of v === null || v === undefined ? [] : typeof v === "string" ? [v] : v) {
+    // A Set: an item tagged "a" twice is listed under "a" once.
+    for (const key of new Set(v === null || v === undefined ? [] : typeof v === "string" ? [v] : v)) {
       const list = out.get(key);
       if (list) list.push(item);
       else out.set(key, [item]);
