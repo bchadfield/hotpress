@@ -20,7 +20,7 @@
     "node": ">=22.12.0"
   },
   "bin": {
-    "hotpress": "./dist/cli.js"
+    "hotpress": "dist/cli.js"
   },
   "exports": {
     ".": {
