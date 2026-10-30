@@ -71,14 +71,25 @@ export class StaticHost {
     return this.files.has("404.html") ? { status: 404, file: "404.html" } : { status: 404 };
   }
 
-  /** Follow internal redirects (max 5 hops) and return the final status. */
-  finalStatus(path: string): number {
+  /**
+   * Follow redirects (max 5 hops) and return the final status. A target is resolved like a browser would
+   * (relative, "//host/..." or absolute): on this site (the first of `origins`, or any of them) it is
+   * followed; on any other site it counts as 200, since the URL still leads somewhere.
+   */
+  finalStatus(path: string, origins: string[] = []): number {
+    const here = new URL(origins[0] ?? "https://hotpress.invalid");
     let current = path;
     for (let hop = 0; hop < 5; hop++) {
       const res = this.resolve(current);
       if (res.status < 300 || res.status >= 400 || !res.location) return res.status;
-      if (/^https?:/.test(res.location)) return res.status;
-      current = res.location;
+      let target: URL;
+      try {
+        target = new URL(res.location, new URL(current, here));
+      } catch {
+        return res.status;
+      }
+      if (target.origin !== here.origin && !origins.includes(target.origin)) return 200;
+      current = target.pathname;
     }
     return 310;
   }

@@ -42,6 +42,22 @@ function git(cwd: string, args: string[], allowFail = false): string {
   }
 }
 
+/** Lockfiles, nearest first within a folder, and the install that reproduces each exactly. */
+const LOCKFILES: [string, string[]][] = [
+  ["package-lock.json", ["npm", "ci", "--no-audit", "--no-fund"]],
+  ["npm-shrinkwrap.json", ["npm", "ci", "--no-audit", "--no-fund"]],
+  ["pnpm-lock.yaml", ["pnpm", "install", "--frozen-lockfile"]],
+  ["yarn.lock", ["yarn", "install", "--frozen-lockfile"]],
+  ["bun.lock", ["bun", "install", "--frozen-lockfile"]],
+  ["bun.lockb", ["bun", "install", "--frozen-lockfile"]]
+];
+
+/** The site folder and each folder above it up to the repository root ("a/b" -> ["a/b", "a", ""]). */
+function siteAndAncestors(siteRel: string): string[] {
+  const parts = siteRel ? siteRel.split("/") : [];
+  return [...parts.map((_, i) => parts.slice(0, parts.length - i).join("/")), ""];
+}
+
 async function siteConfig(root: string, configFile?: string): Promise<Partial<SiteOptions>> {
   const mod = await importSiteModule({ root, cacheDir: join(root, ".hotpress-cache"), clientScripts: new Set(), inputs: new Set() }, findSiteFile(root, configFile));
   return (mod.default as SiteOptions | undefined) ?? {};
@@ -97,6 +113,7 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
   };
 
   // 3. Build that exact commit in a clean worktree, so forgotten or ignored files show up as failures.
+  const sitemapCache = new Map<string, Promise<string[]>>();
   const checkCommit = async (sha: string, fix: boolean): Promise<{ result: CheckResult; fixed: Map<string, Buffer> }> => {
     const work = join(root, ".hotpress-cache", "publish-worktree");
     git(root, ["worktree", "remove", "--force", work], true);
@@ -104,15 +121,22 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
     git(root, ["worktree", "add", "--quiet", "--detach", work, sha]);
     try {
       const siteRoot = join(work, siteRel);
-      const lockHere = join(options.root, "package-lock.json");
-      const lockThere = join(siteRoot, "package-lock.json");
-      const sameLock = existsSync(lockHere) && existsSync(lockThere) && readFileSync(lockHere, "utf8") === readFileSync(lockThere, "utf8");
-      if (existsSync(join(options.root, "node_modules")) && sameLock) {
-        await symlink(join(options.root, "node_modules"), join(siteRoot, "node_modules"), "dir");
-      } else if (existsSync(lockThere)) {
-        log("package-lock.json differs from the installed packages: running npm ci in the publish worktree");
-        // npm's output goes to stderr: stdout may be carrying --json for an agent.
-        execFileSync("npm", ["ci", "--no-audit", "--no-fund"], { cwd: siteRoot, stdio: ["ignore", 2, 2] });
+      // The lockfile nearest the site decides its packages (a workspace keeps it at its root, with
+      // node_modules hoisted there): reuse what is installed if the commit has the same lockfile.
+      const dirs = siteAndAncestors(siteRel);
+      const lock = dirs.flatMap((dir) => LOCKFILES.map(([name, install]) => ({ dir, name, install }))).find((l) => existsSync(join(root, l.dir, l.name)));
+      const lockThere = lock && join(work, lock.dir, lock.name);
+      const committedLock = lock !== undefined && existsSync(lockThere!);
+      // An untracked or ignored lockfile can't be installed from: build with what is installed, as with none.
+      if (lock && !committedLock) log(`${join(lock.dir, lock.name)} isn't in the commit (untracked or ignored): building with the installed packages`);
+      const sameLock = !committedLock || readFileSync(join(root, lock.dir, lock.name)).equals(readFileSync(lockThere!));
+      const installed = dirs.filter((dir) => existsSync(join(root, dir, "node_modules")));
+      if (sameLock && installed.length) {
+        for (const dir of installed) await symlink(join(root, dir, "node_modules"), join(work, dir, "node_modules"), "dir");
+      } else if (committedLock) {
+        log(`${lock.name} differs from the installed packages: running ${lock.install.join(" ")} in the publish worktree`);
+        // The installer's output goes to stderr: stdout may be carrying --json for an agent.
+        execFileSync(lock.install[0], lock.install.slice(1), { cwd: join(work, lock.dir), stdio: ["ignore", 2, 2] });
       }
       const result = await check({
         root: siteRoot,
@@ -122,6 +146,7 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
         twice: options.twice,
         fix,
         legacyIndex: join(options.root, ".hotpress-cache", "published.json"),
+        sitemapCache,
         log: options.log
       });
       const fixed = new Map(result.fixed.map((file) => [file, readFileSync(join(siteRoot, file))]));

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile, readdir } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, utimes, writeFile, readdir } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { build } from "../src/build/build.ts";
@@ -229,4 +230,121 @@ test("nested index files take their folder's slug; JSON problems name the record
   await writeFile(join(dir, "data/items.json"), JSON.stringify([{ slug: "a", n: 1 }]));
   assert.equal((await build({ root: dir, log: false })).ok, true);
   assert.equal(await read(dir, "guides.txt"), "deploy,setup");
+});
+
+/** Make dir a git repository of its own, so test/.tmp being ignored by this checkout doesn't apply. */
+function gitInit(dir: string): void {
+  execFileSync("git", ["init", "--quiet"], { cwd: dir });
+}
+
+test("an out dir in the site holding files no build recorded is refused, and kept", async () => {
+  const dir = await copyExample();
+  gitInit(dir);
+  await mkdir(join(dir, "docs"));
+  await writeFile(join(dir, "docs/notes.md"), "mine");
+  const refused = await build({ root: dir, outDir: "docs", log: false });
+  assert.equal(refused.problems[0]?.code, "bad-out-dir");
+  assert.match(refused.problems[0].message, /"docs" holds files this build didn't write and no earlier build recorded: notes\.md/);
+  assert.equal(await readFile(join(dir, "docs/notes.md"), "utf8"), "mine");
+
+  // An out dir an older version built into: its one manifest for every out dir lists the files.
+  await mkdir(join(dir, "dist"));
+  await writeFile(join(dir, "dist/old-page.html"), "old");
+  await mkdir(join(dir, ".hotpress-cache"), { recursive: true });
+  await writeFile(join(dir, ".hotpress-cache/build-manifest.json"), JSON.stringify({ version: 1, files: { "old-page.html": "x" } }));
+  const upgraded = await build({ root: dir, log: false });
+  assert.equal(upgraded.ok, true, JSON.stringify(upgraded.problems));
+  assert.equal(existsSync(join(dir, "dist/old-page.html")), false);
+  // Once a build has recorded the folder, later builds clean it as usual.
+  await writeFile(join(dir, "dist/stray.txt"), "x");
+  assert.equal((await build({ root: dir, log: false })).ok, true);
+  assert.equal(existsSync(join(dir, "dist/stray.txt")), false);
+});
+
+test("an old build git ignores is replaced even when the cache that recorded it was deleted", async () => {
+  const dir = await copyExample();
+  gitInit(dir);
+  await writeFile(join(dir, ".gitignore"), "dist/\n.hotpress-cache/\n");
+  assert.equal((await build({ root: dir, log: false })).ok, true);
+  const oldCss = (await readdir(join(dir, "dist/assets"))).find((f) => f.endsWith(".css"))!;
+  await rm(join(dir, ".hotpress-cache"), { recursive: true, force: true });
+  await writeFile(join(dir, "styles/main.css"), (await readFile(join(dir, "styles/main.css"), "utf8")) + "\nh2 { color: red; }\n");
+  const result = await build({ root: dir, log: false });
+  assert.equal(result.ok, true, JSON.stringify(result.problems));
+  assert.equal(existsSync(join(dir, "dist/assets", oldCss)), false);
+});
+
+test("git-ignored files people keep are not taken for an old build", async () => {
+  // A single ignored file in an out dir that isn't ignored as a folder.
+  const own = await copyExample();
+  gitInit(own);
+  await writeFile(join(own, ".gitignore"), "*.local.md\n");
+  await mkdir(join(own, "docs"));
+  await writeFile(join(own, "docs/notes.local.md"), "mine");
+  assert.equal((await build({ root: own, outDir: "docs", log: false })).problems[0]?.code, "bad-out-dir");
+  assert.equal(await readFile(join(own, "docs/notes.local.md"), "utf8"), "mine");
+  // A site with no repository of its own, in a folder another one ignores (test/.tmp in this checkout).
+  const outer = await copyExample();
+  await mkdir(join(outer, "docs"));
+  await writeFile(join(outer, "docs/notes.md"), "mine");
+  assert.equal((await build({ root: outer, outDir: "docs", log: false })).problems[0]?.code, "bad-out-dir");
+  assert.equal(await readFile(join(outer, "docs/notes.md"), "utf8"), "mine");
+});
+
+test("a git checkout in the out dir (a gh-pages clone, say) is never cleaned away", async () => {
+  const dir = await copyExample();
+  assert.equal((await build({ root: dir, log: false })).ok, true);
+  gitInit(join(dir, "dist"));
+  await writeFile(join(dir, "dist/stray.txt"), "x");
+  assert.equal((await build({ root: dir, log: false })).ok, true);
+  assert.equal(existsSync(join(dir, "dist/.git/HEAD")), true);
+  assert.equal(existsSync(join(dir, "dist/.git/refs/heads")), true, "empty folders in .git stay too");
+  assert.equal(existsSync(join(dir, "dist/stray.txt")), false);
+});
+
+test("MDX files with the same source compile in one build", async () => {
+  const dir = await copyExample();
+  const notes = join(dir, "content/notes");
+  const source = await readFile(join(notes, (await readdir(notes)).find((f) => f.endsWith(".mdx"))!), "utf8");
+  for (let i = 0; i < 6; i++) await writeFile(join(notes, `copy-${i}.mdx`), source);
+  const result = await build({ root: dir, log: false });
+  assert.equal(result.ok, true, JSON.stringify(result.problems));
+  assert.deepEqual(await readdir(join(dir, ".hotpress-cache/mdx")).then((names) => names.filter((n) => n.endsWith(".tmp"))), []);
+});
+
+test("bundles go in folders per build: another process's are kept until stale", async () => {
+  const dir = await copyExample();
+  const cache = join(dir, ".hotpress-cache");
+  for (const sub of ["site", "mdx-bundle"]) {
+    await mkdir(join(cache, sub, "999999-1"), { recursive: true });
+    await mkdir(join(cache, sub, "999998-1"), { recursive: true });
+    const old = new Date(Date.now() - 60 * 60_000);
+    await utimes(join(cache, sub, "999998-1"), old, old);
+  }
+  assert.equal((await build({ root: dir, log: false })).ok, true);
+  assert.equal((await build({ root: dir, log: false })).ok, true);
+  for (const sub of ["site", "mdx-bundle"]) {
+    const names = await readdir(join(cache, sub));
+    assert.ok(names.includes("999999-1"), `${sub}: a recent folder of another process stays`);
+    assert.ok(!names.includes("999998-1"), `${sub}: a stale one goes`);
+    assert.equal(names.filter((n) => n.startsWith(`${process.pid}-`)).length, 1, `${sub}: only this process's latest`);
+  }
+});
+
+test("compiled MDX is cached per plugin behaviour, not just plugin name", async () => {
+  const dir = await copyExample();
+  const sitePath = join(dir, "hotpress.site.tsx");
+  const source = await readFile(sitePath, "utf8");
+  const withPlugin = (pattern: string) =>
+    writeFile(sitePath, source.replace('mdx("content/notes", { schema: { title: s.string() } })', `mdx("content/notes", { schema: { title: s.string() }, remarkPlugins: [[function noop() { return () => {}; }, { pattern: ${pattern} }]] })`));
+  const cached = async () => (await readdir(join(dir, ".hotpress-cache/mdx"))).length;
+  await withPlugin("/a/");
+  assert.equal((await build({ root: dir, log: false })).ok, true);
+  const first = await cached();
+  assert.ok(first > 0);
+  assert.equal((await build({ root: dir, log: false })).ok, true);
+  assert.equal(await cached(), first, "same plugins: cache reused");
+  await withPlugin("/b/");
+  assert.equal((await build({ root: dir, log: false })).ok, true);
+  assert.equal(await cached(), first * 2, "a changed RegExp option recompiles");
 });

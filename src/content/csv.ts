@@ -20,6 +20,7 @@ export function parseCsvRows(text: string): { line: number; values: string[] }[]
     let field = "";
     let inQuotes = false;
     let quotedField = false;
+    let closedQuote = false;
     for (; i < n; i++) {
       const c = text[i];
       if (inQuotes) {
@@ -29,12 +30,18 @@ export function parseCsvRows(text: string): { line: number; values: string[] }[]
             i++;
           } else {
             inQuotes = false;
+            closedQuote = true;
           }
         } else {
           if (c === "\n") line++;
           field += c;
         }
         continue;
+      }
+      if (closedQuote && c !== "," && c !== "\n" && c !== "\r") {
+        // Spaces after the closing quote are dropped; anything else means the field was quoted wrongly.
+        if (c === " " || c === "\t") continue;
+        throw new CsvError(`line ${line}: unexpected ${JSON.stringify(c)} after a closing quote (quote the whole field, and double any quote inside it)`);
       }
       if (c === '"' && field === "" && !quotedField) {
         inQuotes = true;
@@ -43,6 +50,7 @@ export function parseCsvRows(text: string): { line: number; values: string[] }[]
         values.push(field);
         field = "";
         quotedField = false;
+        closedQuote = false;
       } else if (c === "\n" || c === "\r") {
         if (c === "\r" && text[i + 1] === "\n") i++;
         i++;

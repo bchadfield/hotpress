@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 import { readdirSync, statSync, watch, type FSWatcher } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { extname, join, relative } from "node:path";
+import { extname, join, relative, resolve, sep } from "node:path";
 import type { Duplex } from "node:stream";
-import { build } from "../build/build.ts";
+import { build, isInside } from "../build/build.ts";
 import { formatProblems } from "../errors.ts";
 import { listFiles } from "../diff/files.ts";
 import { StaticHost } from "../diff/host.ts";
@@ -186,39 +186,54 @@ export interface DevServer {
  */
 export const DEV_OUT_DIR = join(".hotpress-cache", "dev");
 
-/** Top-level folders that never hold site sources. */
-const IGNORED = new Set(["node_modules", "dist", ".hotpress-cache"]);
+/** Folders (relative to the root) that never hold site sources. */
+const IGNORED = ["node_modules", "dist", ".hotpress-cache"];
 
 /**
  * Watch the site's sources: the root's own files plus each top-level folder, recursively, except
- * dot-folders, node_modules and build output. One recursive watch on the root would add an inotify watch
- * for every folder in node_modules on Linux.
+ * dot-folders and the `ignored` paths (which may be nested, like "src/out"). One recursive watch on the
+ * root would add an inotify watch for every folder in node_modules on Linux.
  */
-function watchSources(root: string, ignored: Set<string>, onChange: () => void): () => void {
-  const watchers = new Map<string, FSWatcher>();
-  const skip = (name: string) => name.startsWith(".") || ignored.has(name);
+function watchSources(root: string, ignored: string[], onChange: () => void): () => void {
+  const watchers = new Map<string, { watcher: FSWatcher; ino: number }>();
+  const isIgnored = (rel: string) => ignored.some((dir) => rel === dir || rel.startsWith(`${dir}/`));
+  const skip = (name: string) => name.startsWith(".") || isIgnored(name);
   const watchDir = (name: string) => {
-    if (watchers.has(name) || skip(name)) return;
+    if (skip(name)) return;
+    let st;
     try {
-      if (!statSync(join(root, name)).isDirectory()) return;
-      const w = watch(join(root, name), { recursive: true }, onChange);
-      w.on("error", () => {
-        w.close();
-        watchers.delete(name);
+      st = statSync(join(root, name));
+    } catch {}
+    const current = watchers.get(name);
+    if (current && st?.isDirectory() && st.ino === current.ino) return;
+    // Gone, now a file, or deleted and created again (a branch switch): the old watch sees nothing.
+    if (current) {
+      current.watcher.close();
+      watchers.delete(name);
+    }
+    if (!st?.isDirectory()) return;
+    try {
+      const watcher = watch(join(root, name), { recursive: true }, (_event, filename) => {
+        const rel = filename ? `${name}/${filename.toString().split(sep).join("/")}` : name;
+        if (!isIgnored(rel)) onChange();
       });
-      watchers.set(name, w);
+      watcher.on("error", () => {
+        watcher.close();
+        if (watchers.get(name)?.watcher === watcher) watchers.delete(name);
+      });
+      watchers.set(name, { watcher, ino: st.ino });
     } catch {}
   };
   const top = watch(root, (_event, filename) => {
     const name = filename?.toString();
     if (!name || skip(name)) return;
-    watchDir(name); // a new folder
+    watchDir(name); // a new, removed or replaced folder
     onChange();
   });
   for (const name of readdirSync(root)) watchDir(name);
   return () => {
     top.close();
-    for (const w of watchers.values()) w.close();
+    for (const { watcher } of watchers.values()) watcher.close();
   };
 }
 
@@ -234,13 +249,16 @@ export async function startDev(options: DevOptions): Promise<DevServer> {
   let timer: NodeJS.Timeout | undefined;
   let running = false;
   let again = false;
+  let closed = false;
   const rebuild = async () => {
+    if (closed) return;
     if (running) {
       again = true;
       return;
     }
     running = true;
     const result = await build(buildOptions).catch((error: Error) => ({ ok: false, problems: [{ code: "crash", message: error.stack ?? String(error) }] }));
+    if (closed) return;
     if (result.ok) {
       await server.refresh();
       server.broadcast("reload");
@@ -254,8 +272,11 @@ export async function startDev(options: DevOptions): Promise<DevServer> {
     }
   };
 
-  // A configured outDir (where `build` writes) must not trigger dev rebuilds either.
-  const ignored = new Set([...IGNORED, relative(options.root, join(options.root, first.config?.outDir ?? "dist")).split(/[/\\]/)[0]]);
+  // A configured outDir (where `build` writes) must not trigger dev rebuilds either; only that folder,
+  // not the top-level folder it is in ("src/out" leaves the rest of src watched).
+  const configured = resolve(options.root, first.config?.outDir ?? "dist");
+  const ignored =
+    configured !== resolve(options.root) && isInside(configured, options.root) ? [...IGNORED, relative(options.root, configured).split(sep).join("/")] : IGNORED;
   const stopWatching = watchSources(options.root, ignored, () => {
     clearTimeout(timer);
     timer = setTimeout(rebuild, 80);
@@ -264,6 +285,7 @@ export async function startDev(options: DevOptions): Promise<DevServer> {
     url: server.url,
     outDir,
     async close() {
+      closed = true;
       clearTimeout(timer);
       stopWatching();
       await server.close();

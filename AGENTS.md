@@ -90,9 +90,10 @@ npx hotpress publish -m "Add post about X" --all --json
 
 `publish` exits non-zero with `problems: [{ code, message, url?, file?, line?, field?, hint? }]`.
 Codes: `schema`, `transform`, `csv`, `frontmatter`, `compile`, `render`, `site-code`, `duplicate-url`,
-`duplicate-slug`, `bad-url`, `bad-out-dir`, `link-broken`, `seo`, `url-removed`, `date-stale`, `nondeterministic`, `git-*`,
-`nothing-to-publish`. Fix the cause and run it again. Known, accepted issues go in the site's
-`check.allow` (`"code:glob"`) with a comment saying why. Don't add them silently.
+`duplicate-slug`, `bad-url`, `bad-out-dir`, `link-broken`, `seo`, `url-removed`, `date-stale`, `nondeterministic`,
+`published-index`, `git-*`, `nothing-to-publish`. Fix the cause and run it again. Known, accepted issues go in the
+site's `check.allow` (`"code:glob"`, matched against the problem's URL, field or file) with a comment saying why.
+Don't add them silently.
 
 ## Migrating a site
 

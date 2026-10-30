@@ -7,13 +7,14 @@ export interface Frontmatter {
   bodyLine: number;
 }
 
-const FENCE = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/;
+// The YAML group is optional (and tried last), so an empty block ("---" then "---") is frontmatter too.
+const FENCE = /^---[ \t]*\r?\n(?:([\s\S]*?)\r?\n)??---[ \t]*(?:\r?\n|$)/;
 
 export function parseFrontmatter(source: string): Frontmatter {
   const text = source.charCodeAt(0) === 0xfeff ? source.slice(1) : source;
   const match = FENCE.exec(text);
   if (!match) return { data: {}, body: text, bodyLine: 1 };
-  const yaml = match[1];
+  const yaml = match[1] ?? "";
   // YAML 1.1 types would turn bare dates into Date objects in the local zone and "no" into false;
   // the core schema keeps them as strings and the collection schema decides.
   const data = (yaml.trim() ? parse(yaml, { schema: "core" }) : {}) as unknown;

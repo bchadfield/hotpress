@@ -2,10 +2,10 @@
 
 import { readFileSync } from "node:fs";
 import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { build, type BuildResult } from "../build/build.ts";
 import type { PageMeta, SiteTask, TaskPage, TaskResult } from "../build/site.ts";
-import { formatProblem, type Problem } from "../errors.ts";
+import { HotpressError, formatProblem, type Problem } from "../errors.ts";
 import { fileToUrl, globToRegExp, listFiles } from "../diff/files.ts";
 import { StaticHost } from "../diff/host.ts";
 import { extractPage, type PageSeo } from "../diff/html.ts";
@@ -27,6 +27,8 @@ export interface CheckOptions {
   publishedIndex?: string;
   /** Read this instead when the published index doesn't exist (older versions kept it in .hotpress-cache). */
   legacyIndex?: string;
+  /** Live sitemaps already fetched in this run, by URL (publish checks twice). */
+  sitemapCache?: Map<string, Promise<string[]>>;
   /** Let the site's tasks update files (publish, `check --fix`). */
   fix?: boolean;
   /** Publish date for tasks, YYYY-MM-DD (default: HOTPRESS_TODAY, else today in UTC). */
@@ -68,16 +70,35 @@ export const PUBLISHED_INDEX = "hotpress.published.json";
 /** Hashed bundle names from older indexes, which listed bundled assets too. */
 const LEGACY_ASSET = /(^|\/)(chunk\.)?[^/]*\.[A-Za-z0-9_-]{8,}\.(css|js|mjs)$/;
 
+/**
+ * The last publish's index, or undefined if none was recorded. A published index that can't be read is an
+ * error, not a first publish: the checks that compare with it would otherwise be skipped without a word.
+ * The legacy file is only a cache, so it is ignored when unreadable.
+ */
 export async function readPublishedIndex(path: string, legacy?: string): Promise<PublishedIndex | undefined> {
   for (const file of legacy ? [path, legacy] : [path]) {
-    let index: { version: number } & Omit<PublishedIndex, "version">;
+    const bad = (message: string): undefined => {
+      if (file === legacy) return undefined;
+      throw new HotpressError({ code: "published-index", file: basename(file), message, hint: `restore it from git (git checkout -- ${basename(file)}); publish rewrites it` });
+    };
+    let text: string;
     try {
-      index = JSON.parse(await readFile(file, "utf8"));
-    } catch {
+      text = await readFile(file, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      bad(`can't be read: ${(error as Error).message}`);
       continue;
     }
-    if (index.version === 2) return index as PublishedIndex;
-    if (index.version === 1) return { ...index, version: 2, urls: index.urls.filter((u) => !LEGACY_ASSET.test(u)) };
+    let index: { version: number } & Omit<PublishedIndex, "version">;
+    try {
+      index = JSON.parse(text);
+    } catch (error) {
+      bad(`is not valid JSON: ${(error as Error).message}`);
+      continue;
+    }
+    if (index?.version === 2 && Array.isArray(index.urls) && index.pages && typeof index.pages === "object") return index as PublishedIndex;
+    if (index?.version === 1 && Array.isArray(index.urls)) return { ...index, version: 2, urls: index.urls.filter((u) => !LEGACY_ASSET.test(u)) };
+    bad(`has an unknown format (version ${JSON.stringify(index?.version)}); a newer Hotpress may have written it`);
   }
   return undefined;
 }
@@ -96,14 +117,15 @@ export async function writePublishedIndex(path: string, index: PublishedIndex): 
   await writeFile(path, formatPublishedIndex(index));
 }
 
+/** "code" allows every problem with that code; "code:glob" those whose URL, field or file matches. */
 function allowedBy(problem: Problem, rules: string[]): boolean {
   return rules.some((rule) => {
     const idx = rule.indexOf(":");
     const code = idx < 0 ? rule : rule.slice(0, idx);
-    const glob = idx < 0 ? "**" : rule.slice(idx + 1);
     if (code !== problem.code) return false;
-    const re = globToRegExp(glob);
-    return [problem.url, problem.field].some((v) => v !== undefined && re.test(v));
+    if (idx < 0) return true;
+    const re = globToRegExp(rule.slice(idx + 1));
+    return [problem.url, problem.field, problem.file].some((v) => v !== undefined && re.test(v));
   });
 }
 
@@ -131,15 +153,24 @@ export async function check(options: CheckOptions): Promise<CheckResult> {
     return result;
   }
   const tasks = built.config?.tasks ?? [];
+  const allow = [...(built.config?.check?.allow ?? []), ...(options.allow ?? [])];
 
   // Site tasks get the first chance to fix things; the checks below then see the rebuilt site.
   if (options.fix && tasks.length) {
+    const taskProblems: Problem[] = [];
     for (const task of tasks) {
       const outcome = await runTask(task, built, true, today);
       result.fixed.push(...(outcome.changed ?? []));
-      result.problems.push(...(outcome.problems ?? []));
+      taskProblems.push(...(outcome.problems ?? []));
     }
-    if (result.problems.length) return result;
+    // Allowed ones are reported again by the report-only run of the tasks below.
+    const blocking = taskProblems.filter((p) => !allowedBy(p, allow));
+    if (blocking.length) {
+      result.problems = blocking;
+      result.allowed = taskProblems.filter((p) => allowedBy(p, allow));
+      log(formatCheck(result));
+      return result;
+    }
     if (result.fixed.length) {
       log(`Site tasks updated ${result.fixed.join(", ")}; rebuilding.`);
       built = await build({ root: options.root, configFile: options.configFile, mode: "production", log: options.log });
@@ -152,7 +183,6 @@ export async function check(options: CheckOptions): Promise<CheckResult> {
   }
   const origin = built.origin!;
   const settings = built.config?.check ?? {};
-  const allow = [...(settings.allow ?? []), ...(options.allow ?? [])];
   const problems: Problem[] = [];
 
   const files = await listFiles(built.outDir);
@@ -188,14 +218,23 @@ export async function check(options: CheckOptions): Promise<CheckResult> {
 
   // Nothing that was published may disappear without a redirect.
   const indexPath = options.publishedIndex ?? join(options.root, PUBLISHED_INDEX);
-  const previous = await readPublishedIndex(indexPath, options.legacyIndex ?? join(options.root, ".hotpress-cache", "published.json"));
-  const gone = (path: string) => host.finalStatus(path) !== 200;
+  let previous: PublishedIndex | undefined;
+  try {
+    previous = await readPublishedIndex(indexPath, options.legacyIndex ?? join(options.root, ".hotpress-cache", "published.json"));
+  } catch (error) {
+    if (!(error as HotpressError).hotpress) throw error;
+    problems.push(...(error as HotpressError).problems);
+  }
+  const gone = (path: string) => host.finalStatus(path, [origin]) !== 200;
   const removed = new Set<string>();
   for (const url of previous?.urls ?? []) if (gone(url)) removed.add(url);
   if (settings.liveSitemap !== false && !options.offline) {
     const sitemapUrl = settings.liveSitemap || `${origin}/sitemap.xml`;
     try {
-      for (const loc of await fetchSitemapUrls(sitemapUrl)) {
+      // publish checks a commit twice when site tasks change files: fetch the live sitemap once.
+      const fetched = options.sitemapCache?.get(sitemapUrl) ?? fetchSitemapUrls(sitemapUrl);
+      options.sitemapCache?.set(sitemapUrl, fetched);
+      for (const loc of await fetched) {
         let u: URL;
         try {
           u = new URL(loc);

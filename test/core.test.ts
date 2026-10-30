@@ -10,6 +10,8 @@ import { absoluteUrl, atom, jsonLdString, robots, sitemaps, absolutizeHtml, redi
 import { urlToFile } from "../src/build/site.ts";
 import { StaticHost } from "../src/diff/host.ts";
 import { parseRedirects } from "../src/diff/netlify.ts";
+import { Script } from "../src/build/scripts.ts";
+import { execFileSync } from "node:child_process";
 
 test("jsx escapes text and attributes, keeps raw html", () => {
   const html = render(jsx("p", { title: 'a "b" & c', children: ["<b>x</b>", raw("<i>y</i>")] }));
@@ -209,4 +211,66 @@ test("feeds, robots, JSON-LD, Netlify files, absolute URLs", () => {
   assert.equal(absoluteUrl("https://x.com/", "/a/"), "https://x.com/a/");
   assert.equal(absoluteUrl("https://x.com", "https://y.com/"), "https://y.com/");
   assert.equal(absolutizeHtml('<a href="/a/">x</a><img src="b.png"><a href="#f">', "https://x.com/p/"), '<a href="https://x.com/a/">x</a><img src="https://x.com/p/b.png"><a href="#f">');
+});
+
+test("host: absolute redirects to the site are followed; to another site, the URL still resolves", () => {
+  const rules = "/old/ https://example.com/new/ 301\n/lost/ https://example.com/missing/ 301\n/go/ https://partner.example/ 302\n";
+  const host = new StaticHost(["new/index.html"], parseRedirects(rules));
+  assert.equal(host.finalStatus("/old/", ["https://example.com"]), 200);
+  assert.equal(host.finalStatus("/lost/", ["https://example.com"]), 404);
+  assert.equal(host.finalStatus("/go/", ["https://example.com"]), 200);
+  // "//host/..." is resolved like a browser would: another site, or this one.
+  const relative = new StaticHost(["new/index.html"], parseRedirects("/cdn/ //cdn.example.net/new/ 301\n/self/ //example.com/new/ 301\n/gone/ //example.com/missing/ 301\n/up/ ../new/ 301\n"));
+  assert.equal(relative.finalStatus("/cdn/", ["https://example.com"]), 200);
+  assert.equal(relative.finalStatus("/self/", ["https://example.com"]), 200);
+  assert.equal(relative.finalStatus("/gone/", ["https://example.com"]), 404);
+  assert.equal(relative.finalStatus("/up/"), 200);
+});
+
+test("frontmatter: an empty block is frontmatter, and only the first block counts", () => {
+  assert.deepEqual(parseFrontmatter("---\n---\nHello\n"), { data: {}, body: "Hello\n", bodyLine: 3 });
+  assert.deepEqual(parseFrontmatter("---\n---\nHello\n---\nmore\n"), { data: {}, body: "Hello\n---\nmore\n", bodyLine: 3 });
+  assert.deepEqual(parseFrontmatter("---\na: 1\n---\nx").data, { a: 1 });
+});
+
+test("related counts a repeated value once", () => {
+  const item = { t: ["a", "b"] };
+  const twiceA = { t: ["a", "a"] };
+  const both = { t: ["a", "b"] };
+  assert.deepEqual(related(item, [item, twiceA, both], (x) => x.t), [both, twiceA]);
+});
+
+test("csv: text after a closing quote is an error; spaces there are dropped", () => {
+  assert.throws(() => parseCsv('a,b\n"x"y,z\n'), /line 2: unexpected "y" after a closing quote/);
+  assert.deepEqual(parseCsv('a,b\n"x"  ,z\n', { trim: false }).records[0].fields, { a: "x", b: "z" });
+});
+
+test("Script escapes a string src", () => {
+  const ctx = { url: "/", href: "https://x.com/", origin: "https://x.com", mode: "build" as const, meta: {}, scripts: new Set<string>() };
+  const html = withPage(ctx, () => render(jsx(Script, { src: '/a.js" onload="x' })));
+  assert.equal(html, '<script type="module" src="/a.js&quot; onload=&quot;x"></script>');
+});
+
+test("CLI: bad flags are usage errors (exit 2, no stack trace)", () => {
+  const cli = new URL("../src/cli.ts", import.meta.url).pathname;
+  const run = (...args: string[]) => {
+    try {
+      execFileSync(process.execPath, ["--conditions=hotpress-source", cli, ...args], { encoding: "utf8", stdio: "pipe" });
+      return { code: 0, err: "" };
+    } catch (error) {
+      const e = error as { status: number; stderr: string };
+      return { code: e.status, err: e.stderr };
+    }
+  };
+  for (const [args, message] of [
+    [["dev", "--port", "abc"], /--port must be a whole number from 0 to 65535, got "abc"/],
+    [["serve", "--port", "70000"], /--port must be a whole number/],
+    [["build", "--check", "--out", "x"], /--out can't be combined with --check/],
+    [["build", "--nope"], /Unknown option '--nope'/]
+  ] as const) {
+    const r = run(...args);
+    assert.equal(r.code, 2, args.join(" "));
+    assert.match(r.err, message);
+    assert.doesNotMatch(r.err, /\n\s+at /, "no stack trace");
+  }
 });

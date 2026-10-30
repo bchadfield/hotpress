@@ -2,7 +2,7 @@
 // rendering <Script src={handle} /> adds the bundled script to that page only.
 
 import { usePage } from "../jsx/context.ts";
-import { raw, type Html } from "../jsx/runtime.ts";
+import { escapeAttr, raw, type Html } from "../jsx/runtime.ts";
 
 export interface ClientScript {
   readonly __hotpressClient: string;
@@ -46,5 +46,5 @@ export function Script(props: ScriptProps): Html {
   if (page.scripts.has(url)) return raw("");
   page.scripts.add(url);
   const type = props.type === "classic" ? "" : ` type="module"`;
-  return raw(`<script${type} src="${url}"${props.defer ? " defer" : ""}${props.async ? " async" : ""}></script>`);
+  return raw(`<script${type} src="${escapeAttr(url)}"${props.defer ? " defer" : ""}${props.async ? " async" : ""}></script>`);
 }

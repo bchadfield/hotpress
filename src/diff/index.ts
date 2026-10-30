@@ -372,7 +372,7 @@ export function findBrokenLinks(
       const path = target.pathname;
       let status = statusCache.get(path);
       if (status === undefined) {
-        status = host.finalStatus(path);
+        status = host.finalStatus(path, [...origins, new URL(primary).origin]);
         statusCache.set(path, status);
       }
       if (status !== 200) broken.set(`${fileToUrl(file)} ${ref.from} ${path}`, { url: fileToUrl(file), from: ref.from, target: `${path} (${status})`, path, status });

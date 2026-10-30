@@ -85,7 +85,14 @@ export default defineSite({
           </ul>
         </Layout>
       ),
-      { updated: posts[0]?.data.updated ?? posts[0]?.data.date }
+      // A list of posts: it changes whenever a post does, so it has no \`updated\` of its own for the
+      // date-stale check to hold it to. \`lastmod\` gives the sitemap the newest post's date instead.
+      {
+        lastmod: posts.reduce<Date | undefined>((latest, post) => {
+          const date = post.data.updated ?? post.data.date;
+          return !latest || date > latest ? date : latest;
+        }, undefined)
+      }
     );
 
     site.page(
@@ -101,7 +108,9 @@ export default defineSite({
       { noindex: true }
     );
 
-    const urls = site.pages.filter((p) => !p.meta.noindex).map((p) => ({ loc: absoluteUrl(site.origin, p.url), lastmod: p.meta.updated }));
+    const urls = site.pages
+      .filter((p) => !p.meta.noindex)
+      .map((p) => ({ loc: absoluteUrl(site.origin, p.url), lastmod: p.meta.updated ?? (p.meta.lastmod as Date | undefined) }));
     for (const [file, xml] of Object.entries(sitemaps("sitemap.xml", site.origin, urls, { formatDate: (d) => d.toISOString().slice(0, 10) }))) {
       site.file(file, xml);
     }
@@ -189,6 +198,18 @@ const SCRIPTS: Record<string, string> = {
 
 const IGNORES = ["node_modules/", "dist/", ".hotpress-cache/"];
 
+/** A valid npm package name from a site name ("My Site!" -> "my-site"). */
+function packageName(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 214)
+    .replace(/-+$/, "");
+  return slug || "site";
+}
+
 export async function init(options: InitOptions): Promise<InitResult> {
   const root = options.root;
   const log = options.log === false ? () => {} : (m: string) => process.stdout.write(m + "\n");
@@ -197,7 +218,7 @@ export async function init(options: InitOptions): Promise<InitResult> {
   const origin = (options.origin ?? "https://example.com").replace(/\/+$/, "");
   if (!/^https?:\/\/[^/]+$/.test(origin)) throw new HotpressError({ code: "bad-origin", message: `origin must be like "https://example.com", got "${options.origin}"` });
   const today = options.today ?? new Date().toISOString().slice(0, 10);
-  const name = options.name ?? basename(root);
+  const name = options.name || basename(root) || "My site";
   const result: InitResult = { created: [], kept: [], updated: [] };
 
   const files: Record<string, string> = {
@@ -207,6 +228,16 @@ export async function init(options: InitOptions): Promise<InitResult> {
     "styles/main.css": STYLES,
     "tsconfig.json": TSCONFIG
   };
+  // The site module imports Layout and site from here: someone else's file there would break the starter.
+  const layoutPath = join(root, "src/Layout.tsx");
+  if (existsSync(layoutPath) && (await readFile(layoutPath, "utf8")) !== files["src/Layout.tsx"]) {
+    throw new HotpressError({
+      code: "init-exists",
+      message: "src/Layout.tsx already exists, and the starter's site module needs its own",
+      file: "src/Layout.tsx",
+      hint: "move it aside, or run init in a new folder"
+    });
+  }
   for (const [file, content] of Object.entries(files)) {
     const path = join(root, file);
     if (existsSync(path)) {
@@ -221,7 +252,7 @@ export async function init(options: InitOptions): Promise<InitResult> {
   // package.json: add what's missing, never change what's there.
   const pkgPath = join(root, "package.json");
   const hadPkg = existsSync(pkgPath);
-  const pkg = hadPkg ? (JSON.parse(await readFile(pkgPath, "utf8")) as Record<string, unknown>) : { name: name.toLowerCase().replace(/[^a-z0-9-]+/g, "-"), private: true };
+  const pkg = hadPkg ? (JSON.parse(await readFile(pkgPath, "utf8")) as Record<string, unknown>) : { name: packageName(name), private: true };
   const scripts = (pkg.scripts ?? {}) as Record<string, string>;
   let changed = !hadPkg;
   for (const [key, value] of Object.entries(SCRIPTS)) {
@@ -231,7 +262,10 @@ export async function init(options: InitOptions): Promise<InitResult> {
     }
   }
   pkg.scripts = scripts;
-  pkg.engines ??= { node: ">=22.12.0" };
+  if (pkg.engines === undefined) {
+    pkg.engines = { node: ">=22.12.0" };
+    changed = true;
+  }
   if (changed) {
     await writeFile(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
     (hadPkg ? result.updated : result.created).push("package.json");

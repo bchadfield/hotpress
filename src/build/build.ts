@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -76,6 +77,9 @@ export function findSiteFile(root: string, configFile?: string): string {
   throw new HotpressError({ code: "no-site", message: `no site module found in ${root}`, hint: `create ${SITE_FILES[0]} (see the README quick start)` });
 }
 
+/** A git checkout's own files (a gh-pages clone or worktree in the out dir, say): never listed, so never deleted. */
+const GIT = ".git";
+
 async function listDir(dir: string, base = dir): Promise<string[]> {
   let entries;
   try {
@@ -85,6 +89,7 @@ async function listDir(dir: string, base = dir): Promise<string[]> {
   }
   const out: string[] = [];
   for (const e of entries) {
+    if (e.name === GIT) continue;
     const full = join(dir, e.name);
     if (e.isDirectory()) out.push(...(await listDir(full, base)));
     else if (e.isFile()) out.push(relative(base, full).split(sep).join("/"));
@@ -101,7 +106,7 @@ async function readJson<T extends { version: number }>(path: string): Promise<T 
   }
 }
 
-function isInside(path: string, dir: string): boolean {
+export function isInside(path: string, dir: string): boolean {
   const rel = relative(dir, path);
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
@@ -110,9 +115,17 @@ function isInside(path: string, dir: string): boolean {
  * The out dir is emptied of everything the build didn't write, so it must never hold anything else:
  * not the site, its sources or public files, and not a folder of someone else's files.
  */
-async function checkOutDir(root: string, outDir: string, inputs: Iterable<string>, publicDir: string | undefined, written: boolean): Promise<void> {
-  const fail = (message: string): never => {
-    throw new HotpressError({ code: "bad-out-dir", message, hint: "build into a folder of its own, such as dist" });
+async function checkOutDir(
+  root: string,
+  outDir: string,
+  inputs: Iterable<string>,
+  publicDir: string | undefined,
+  outputs: Map<string, Output>,
+  written: Manifest | undefined,
+  legacy: Manifest | undefined
+): Promise<void> {
+  const fail = (message: string, hint = "build into a folder of its own, such as dist"): never => {
+    throw new HotpressError({ code: "bad-out-dir", message, hint });
   };
   const rel = relative(root, outDir) || ".";
   if (isInside(root, outDir)) fail(`the out dir "${rel}" contains the site itself, and the build deletes files it didn't write`);
@@ -121,8 +134,52 @@ async function checkOutDir(root: string, outDir: string, inputs: Iterable<string
   for (const input of inputs) {
     if (isInside(input, outDir)) fail(`the out dir "${rel}" contains ${relative(root, input)}, which the build reads`);
   }
-  if (!written && !isInside(outDir, root) && (await listDir(outDir)).length) {
+  if (written) return;
+  const existing = await listDir(outDir);
+  if (!isInside(outDir, root) && existing.length) {
     fail(`the out dir "${outDir}" is outside the site, not empty, and wasn't written by a previous build`);
+  }
+  // With no record of a build here, a file the build would delete may be someone's own (docs/, say).
+  // Older versions kept one manifest for every out dir: what it lists was written by a build. So is an
+  // out dir the site's repository ignores as a whole (dist/ after the cache was deleted, say), apart from
+  // anything committed in it.
+  let strays = existing.filter((file) => !outputs.has(file) && !(legacy && Object.hasOwn(legacy.files, file)));
+  if (strays.length && ignoredBuildFolder(root, outDir)) {
+    const tracked = gitTracked(outDir);
+    strays = strays.filter((file) => tracked.has(file));
+  }
+  if (strays.length) {
+    fail(
+      `the out dir "${rel}" holds files this build didn't write and no earlier build recorded: ${strays.slice(0, 3).join(", ")}${strays.length > 3 ? `, … (${strays.length})` : ""}`,
+      "build into a folder of its own, such as dist; if this folder is only an old build, delete it or add it to .gitignore"
+    );
+  }
+}
+
+/**
+ * Whether git ignores the out dir as a folder while the site itself is not ignored: the mark of a build
+ * folder (init ignores dist/). Single ignored files say nothing (people ignore notes and .env files they
+ * keep), and nor does a site with no repository of its own inside a folder another repository ignores.
+ */
+function ignoredBuildFolder(root: string, outDir: string): boolean {
+  const ignored = (path: string): boolean | undefined => {
+    try {
+      execFileSync("git", ["check-ignore", "-q", "--", path], { cwd: root, stdio: "ignore" });
+      return true;
+    } catch (error) {
+      // 1: not ignored; anything else (no git, not a repository): unknown.
+      return (error as { status?: number }).status === 1 ? false : undefined;
+    }
+  };
+  return ignored(".") === false && ignored(`${relative(root, outDir).split(sep).join("/")}/`) === true;
+}
+
+/** Files committed (or staged) under dir, relative to it. */
+function gitTracked(dir: string): Set<string> {
+  try {
+    return new Set(execFileSync("git", ["ls-files", "-z", "--", "."], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split("\0").filter(Boolean));
+  } catch {
+    return new Set();
   }
 }
 
@@ -133,7 +190,7 @@ async function removeEmptyDirs(dir: string, root: string): Promise<void> {
   } catch {
     return;
   }
-  for (const e of entries) if (e.isDirectory()) await removeEmptyDirs(join(dir, e.name), root);
+  for (const e of entries) if (e.isDirectory() && e.name !== GIT) await removeEmptyDirs(join(dir, e.name), root);
   if (dir !== root && (await readdir(dir)).length === 0) await rmdir(dir);
 }
 
@@ -230,7 +287,8 @@ export async function build(options: BuildOptions): Promise<BuildResult> {
     // One manifest per output directory: it records what is on disk there, and dev builds elsewhere.
     const manifestPath = join(cacheDir, `build-manifest-${sha1(outDir).slice(0, 12)}.json`);
     const previous = await readJson<Manifest>(manifestPath);
-    await checkOutDir(root, outDir, state.inputs, publicDir, previous !== undefined);
+    const legacy = previous ? undefined : await readJson<Manifest>(join(cacheDir, "build-manifest.json"));
+    await checkOutDir(root, outDir, state.inputs, publicDir, outputs, previous, legacy);
     const { report, files } = await writeOutputs(outDir, cacheDir, manifestPath, previous, outputs, pageHashes, new Set(site.pages.map((p) => p.file)), mode);
     result.report = report;
     result.files = files;

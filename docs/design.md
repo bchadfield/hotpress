@@ -140,7 +140,8 @@ alongside it can't change what it serves.
    fetch, and `dist/` and the cache aren't tracked.
 2. **Commit locally**, using the agent's message. It includes only staged changes, or everything with `--all`.
 3. **Build from the commit, not the working tree.** A temporary worktree is checked out at the new commit, with
-   `node_modules` linked if the lockfile hasn't changed, and built there. This catches files you
+   the installed `node_modules` linked (the site's, and a workspace root's) if the lockfile (npm, pnpm, yarn or
+   bun) hasn't changed, or a frozen install otherwise, and built there. This catches files you
    forgot to add, inputs you rely on that are gitignored, and filename casing problems. What gets
    checked is exactly what the host will build.
 4. **Checks**, each with an error code:

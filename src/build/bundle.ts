@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -42,44 +43,93 @@ function clientPlugin(state: BundleState): esbuild.Plugin {
 const PACKAGE = "@benchadfield/hotpress";
 
 let buildCounter = 0;
+let tempCounter = 0;
 
-type MdxCompile = (source: string, file: string, options: MdxCompileOptions) => Promise<string>;
-let mdxCompiler: MdxCompile | undefined;
+interface MdxCompiler {
+  compile: (source: string, file: string, options: MdxCompileOptions) => Promise<string>;
+  /** What the compiled output depends on besides the source and plugins: the compiler and the JSX runtime. */
+  id: string;
+}
 
-async function loadMdx(root: string): Promise<MdxCompile> {
-  if (mdxCompiler) return mdxCompiler;
-  let mod: { compile: (src: string, opts: Record<string, unknown>) => Promise<{ toString(): string }> };
+// One per installed copy of @mdx-js/mdx: two sites in one process may use different versions.
+const mdxCompilers = new Map<string, Promise<MdxCompiler>>();
+
+/** The version from the package.json that owns a resolved file. */
+function packageVersion(file: string, name: string): string {
+  for (let dir = dirname(file); dir !== dirname(dir); dir = dirname(dir)) {
+    const pkg = join(dir, "package.json");
+    if (!existsSync(pkg)) continue;
+    const json = JSON.parse(readFileSync(pkg, "utf8")) as { name?: string; version?: string };
+    if (json.name === name) return json.version ?? "";
+  }
+  return "";
+}
+
+async function loadMdx(root: string): Promise<MdxCompiler> {
+  let path: string;
   try {
-    const require = createRequire(join(root, "package.json"));
-    mod = await import(pathToFileURL(require.resolve("@mdx-js/mdx")).href);
+    path = createRequire(join(root, "package.json")).resolve("@mdx-js/mdx");
   } catch {
     throw new HotpressError({ code: "mdx-missing", message: "MDX files need the @mdx-js/mdx package", hint: "npm install --save-dev @mdx-js/mdx" });
   }
-  mdxCompiler = async (source, file, options) => {
-    const compiled = await mod.compile(source, {
-      jsxImportSource: PACKAGE,
-      outputFormat: "program",
-      development: false,
-      remarkPlugins: options.remarkPlugins,
-      rehypePlugins: options.rehypePlugins
-    });
-    return String(compiled);
-  };
-  return mdxCompiler;
+  let compiler = mdxCompilers.get(path);
+  if (!compiler) {
+    compiler = (async () => {
+      const mod = (await import(pathToFileURL(path).href)) as { compile: (src: string, opts: Record<string, unknown>) => Promise<{ toString(): string }> };
+      return {
+        id: `${MDX_CACHE_FORMAT}|@mdx-js/mdx@${packageVersion(path, "@mdx-js/mdx")}|${PACKAGE}`,
+        async compile(source, _file, options) {
+          const compiled = await mod.compile(source, {
+            jsxImportSource: PACKAGE,
+            outputFormat: "program",
+            development: false,
+            remarkPlugins: options.remarkPlugins,
+            rehypePlugins: options.rehypePlugins
+          });
+          return String(compiled);
+        }
+      };
+    })();
+    mdxCompilers.set(path, compiler);
+  }
+  return compiler;
 }
 
+/** Bump when the cached form of compiled MDX changes. */
+const MDX_CACHE_FORMAT = 2;
+
+/**
+ * Plugins by what they do, not just their name: a function's source text, and its options with nested
+ * functions and regular expressions written out (JSON would drop them, so changing one would reuse stale output).
+ */
 function pluginKey(options: MdxCompileOptions): string {
-  const names = (list?: unknown[]) => (list ?? []).map((p) => (Array.isArray(p) ? `${(p[0] as Function).name}:${JSON.stringify(p[1] ?? null)}` : (p as Function).name)).join(",");
-  return `${names(options.remarkPlugins)}|${names(options.rehypePlugins)}|${options.cacheKey ?? ""}`;
+  const describe = (value: unknown, seen = new Set<unknown>()): string => {
+    if (typeof value === "function") return `fn:${value.toString()}`;
+    if (value instanceof RegExp) return `re:${value.toString()}`;
+    if (Array.isArray(value)) return `[${value.map((v) => describe(v, seen)).join(",")}]`;
+    if (value && typeof value === "object") {
+      if (seen.has(value)) return "[circular]";
+      seen.add(value);
+      const keys = Object.keys(value).sort();
+      return `{${keys.map((k) => `${JSON.stringify(k)}:${describe((value as Record<string, unknown>)[k], seen)}`).join(",")}}`;
+    }
+    return JSON.stringify(value) ?? String(value);
+  };
+  return `${describe(options.remarkPlugins ?? [])}|${describe(options.rehypePlugins ?? [])}|${options.cacheKey ?? ""}`;
 }
 
 function mdxPlugin(state: BundleState, options: MdxCompileOptions = {}): esbuild.Plugin {
   return {
     name: "hotpress-mdx",
     setup(build) {
+      // The same for every file in this build: worked out once, on the first MDX file.
+      let compilerPromise: Promise<MdxCompiler> | undefined;
+      let plugins: string | undefined;
       build.onLoad({ filter: /\.mdx$/ }, async (args) => {
         const source = await readFile(args.path, "utf8");
-        const key = createHash("sha1").update(source).update("\0").update(pluginKey(options)).digest("hex");
+        const compiler = await (compilerPromise ??= loadMdx(state.root));
+        plugins ??= pluginKey(options);
+        const key = createHash("sha1").update(source).update("\0").update(plugins).update("\0").update(compiler.id).digest("hex");
         const cached = join(state.cacheDir, "mdx", `${key}.js`);
         let code: string;
         try {
@@ -91,17 +141,20 @@ function mdxPlugin(state: BundleState, options: MdxCompileOptions = {}): esbuild
           } catch (error) {
             return { errors: [{ text: `frontmatter: ${(error as Error).message}` }] };
           }
-          const compile = await loadMdx(state.root);
           let body: string;
           try {
             // Pad with newlines so MDX error line numbers match the file.
-            body = await compile("\n".repeat(fm.bodyLine - 1) + fm.body, args.path, options);
+            body = await compiler.compile("\n".repeat(fm.bodyLine - 1) + fm.body, args.path, options);
           } catch (error) {
             return { errors: [{ text: (error as Error).message, location: { file: args.path } }] };
           }
           code = `export const frontmatter = ${JSON.stringify(fm.data)};\n${body}`;
+          // Written whole, then renamed into place: another build may be reading the cache at the same time.
+          // The temp name is unique per write, since two files with the same source share a key.
           await mkdir(dirname(cached), { recursive: true });
-          await writeFile(cached, code);
+          const temp = `${cached}.${process.pid}-${++tempCounter}.tmp`;
+          await writeFile(temp, code);
+          await rename(temp, cached);
         }
         return { contents: code, loader: "js", resolveDir: dirname(args.path) };
       });
@@ -167,12 +220,9 @@ export async function importSiteModule(state: BundleState, entry: string): Promi
 }
 
 async function importOutputs(result: esbuild.BuildResult, outdir: string, main: string): Promise<Record<string, unknown>> {
-  // Each build goes in its own content-addressed folder so Node's module cache never serves a stale copy.
-  const hash = createHash("sha1");
-  for (const f of result.outputFiles!) hash.update(f.path).update(f.contents);
-  const dir = await writeVersioned(outdir, hash.digest("hex").slice(0, 16), result);
+  const dir = await writeVersioned(outdir, result);
   try {
-    return await import(`${pathToFileURL(join(dir, main)).href}?build=${++buildCounter}`);
+    return await import(pathToFileURL(join(dir, main)).href);
   } catch (error) {
     const e = error as Error & { code?: string };
     throw new HotpressError({
@@ -186,11 +236,28 @@ async function importOutputs(result: esbuild.BuildResult, outdir: string, main: 
   }
 }
 
-/** Write a build into outdir/<version>/ and remove older versions. */
-async function writeVersioned(outdir: string, version: string, result: esbuild.BuildResult): Promise<string> {
-  const dir = join(outdir, version);
+/** How long another process's bundle folder is kept: long enough for any build still importing from it. */
+const FOREIGN_BUNDLE_MS = 10 * 60_000;
+
+/**
+ * Write a bundle into a folder of its own, outdir/<pid>-<n>/. Each build gets a new folder, so Node's module
+ * cache never serves a module (or a shared chunk) from an earlier build, and two processes sharing the
+ * cache (dev next to check) never write or delete each other's files: this process's older folders go now,
+ * another's only once it can no longer be loading them.
+ */
+async function writeVersioned(outdir: string, result: esbuild.BuildResult): Promise<string> {
+  const name = `${process.pid}-${++buildCounter}`;
+  const dir = join(outdir, name);
   await mkdir(outdir, { recursive: true });
-  for (const name of await readdir(outdir)) if (name !== version) await rm(join(outdir, name), { recursive: true, force: true });
+  const now = Date.now();
+  for (const entry of await readdir(outdir)) {
+    if (entry === name) continue;
+    const full = join(outdir, entry);
+    const mine = entry.startsWith(`${process.pid}-`);
+    try {
+      if (mine || now - (await stat(full)).mtimeMs > FOREIGN_BUNDLE_MS) await rm(full, { recursive: true, force: true });
+    } catch {}
+  }
   for (const f of result.outputFiles!) {
     const target = join(dir, relative(outdir, f.path));
     await mkdir(dirname(target), { recursive: true });
@@ -219,9 +286,7 @@ export async function importMdxFiles(state: BundleState, files: string[], mdx: M
     throw bundleError(error, state.root);
   }
   recordInputs(state, result.metafile!);
-  const hash = createHash("sha1");
-  for (const f of result.outputFiles!) hash.update(f.path).update(f.contents);
-  const dir = await writeVersioned(outdir, hash.digest("hex").slice(0, 16), result);
+  const dir = await writeVersioned(outdir, result);
   for (const [outPath, meta] of Object.entries(result.metafile!.outputs)) {
     if (!meta.entryPoint) continue;
     const source = join(state.root, meta.entryPoint);

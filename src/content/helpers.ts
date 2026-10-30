@@ -122,12 +122,12 @@ export function paginate<T>(items: T[], size: number, url: (n: number) => string
   }));
 }
 
-/** Items sharing the most values with `item` (e.g. tags), ties kept in input order. */
+/** Items sharing the most values with `item` (e.g. tags), ties kept in input order. A repeated value counts once. */
 export function related<T>(item: T, items: T[], values: (x: T) => readonly string[], limit = 3): T[] {
   const mine = new Set(values(item));
   return items
     .filter((x) => x !== item)
-    .map((x, index) => ({ x, index, score: values(x).filter((v) => mine.has(v)).length }))
+    .map((x, index) => ({ x, index, score: [...new Set(values(x))].filter((v) => mine.has(v)).length }))
     .filter((r) => r.score > 0)
     .sort((a, b) => b.score - a.score || a.index - b.index)
     .slice(0, limit)

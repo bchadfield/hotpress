@@ -26,6 +26,16 @@ diff options
   --examples <n>       Examples shown per group (default 5)
 `;
 
+/** A mistake in the command line: printed without a stack trace, exit code 2. */
+class UsageError extends Error {}
+
+function wholeNumber(value: string | undefined, flag: string, fallback: number, max = Number.MAX_SAFE_INTEGER): number {
+  if (value === undefined) return fallback;
+  const n = Number(value);
+  if (!/^\d+$/.test(value.trim()) || n > max) throw new UsageError(`${flag} must be a whole number${max < Number.MAX_SAFE_INTEGER ? ` from 0 to ${max}` : ""}, got "${value}"`);
+  return n;
+}
+
 async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
   if (!command || command === "--help" || command === "-h" || command === "help") {
@@ -71,7 +81,7 @@ async function main(argv: string[]): Promise<number> {
       probes: values.probe,
       strictWhitespace: values["strict-whitespace"]
     });
-    process.stdout.write(formatReport(report, Number(values.examples ?? 5)) + "\n");
+    process.stdout.write(formatReport(report, wholeNumber(values.examples, "--examples", 5)) + "\n");
     if (values.json) await writeFile(values.json, JSON.stringify(report, null, 2));
     return report.ok ? 0 : 1;
   }
@@ -91,7 +101,7 @@ async function main(argv: string[]): Promise<number> {
     if (command === "build" && values.check) {
       // For CI: build, then every check that needs nothing outside the checkout (site tasks included,
       // report-only). Any problem fails the build, so the host keeps serving the previous deploy.
-      if (values.out) throw new Error("--out can't be combined with --check");
+      if (values.out) throw new UsageError("--out can't be combined with --check (the checks build into the site's own out dir)");
       const { check } = await import("./publish/check.ts");
       const result = await check({ root, configFile: values.config, offline: true });
       if (!result.ok) process.stderr.write("\nBuild stopped: fix the problems above (or publish with `hotpress publish`, which runs the site's tasks).\n");
@@ -103,13 +113,13 @@ async function main(argv: string[]): Promise<number> {
       return result.ok ? 0 : 1;
     }
     const { dev } = await import("./preview/server.ts");
-    await dev({ root, configFile: values.config, port: Number(values.port ?? 4321), thirdParty: values["third-party"] });
+    await dev({ root, configFile: values.config, port: wholeNumber(values.port, "--port", 4321, 65535), thirdParty: values["third-party"] });
     return 0;
   }
   if (command === "serve") {
     const { values, positionals } = parseArgs({ args: rest, allowPositionals: true, options: { port: { type: "string" } } });
     const { serve } = await import("./preview/server.ts");
-    await serve({ dir: resolve(positionals[0] ?? "dist"), port: Number(values.port ?? 4321) });
+    await serve({ dir: resolve(positionals[0] ?? "dist"), port: wholeNumber(values.port, "--port", 4321, 65535) });
     await new Promise(() => {});
     return 0;
   }
@@ -163,7 +173,12 @@ main(process.argv.slice(2)).then(
     process.exitCode = code;
   },
   (error: unknown) => {
-    const err = error as Error & { hotpress?: boolean };
+    const err = error as Error & { hotpress?: boolean; code?: string };
+    if (err instanceof UsageError || err.code?.startsWith("ERR_PARSE_ARGS")) {
+      process.stderr.write(`hotpress: ${err.message}\n`);
+      process.exitCode = 2;
+      return;
+    }
     process.stderr.write(err.hotpress ? `\n${err.message}\n` : `${err.stack ?? err}\n`);
     process.exitCode = 1;
   }
