@@ -296,6 +296,17 @@ async function withTask(dir: string, task: string, settings = ""): Promise<void>
   await writeFile(sitePath, source.replace("export default defineSite({", `const task = ${task};\nexport default defineSite({\n  tasks: [task],${settings}`));
 }
 
+test("files in .well-known/ are served, so links to them work and they are recorded", async () => {
+  const dir = await copySite("well-known-");
+  const sitePath = join(dir, "hotpress.site.tsx");
+  await writeFile(sitePath, (await readFile(sitePath, "utf8")).replace('site.file("_headers"', 'site.file(".well-known/security.txt", "Contact: mailto:security@example.com\\n");\n    site.file("_headers"'));
+  const layout = join(dir, "src/Layout.tsx");
+  await writeFile(layout, (await readFile(layout, "utf8")).replace("<main>{props.children}</main>", '<main>{props.children}<a href="/.well-known/security.txt">Security</a></main>'));
+  const result = await check({ root: dir, offline: true, log: false });
+  assert.equal(result.ok, true, JSON.stringify(result.problems.slice(0, 3)));
+  assert.equal(result.index!.urls.includes("/.well-known/security.txt"), true);
+});
+
 test("pages redirected to an absolute URL are not removed, and links through such redirects are not broken", async () => {
   const dir = await copySite("abs-");
   await writeFile(join(dir, "public/_redirects"), "/moved/ https://example.com/blog/ 301\n/partner/ https://partner.example/ 302\n/lost/ https://example.com/nowhere/ 301\n");

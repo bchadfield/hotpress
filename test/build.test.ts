@@ -291,6 +291,32 @@ test("git-ignored files people keep are not taken for an old build", async () =>
   assert.equal(await readFile(join(outer, "docs/notes.md"), "utf8"), "mine");
 });
 
+test("in an ignored out dir, a file .gitignore un-ignores is kept, and a gh-pages clone there doesn't count", async () => {
+  const dir = await copyExample();
+  gitInit(dir);
+  await writeFile(join(dir, ".gitignore"), "dist/*\n!dist/README.md\n.hotpress-cache/\n");
+  await mkdir(join(dir, "dist"));
+  await writeFile(join(dir, "dist/README.md"), "kept on purpose");
+  assert.equal((await build({ root: dir, log: false })).problems[0]?.code, "bad-out-dir");
+  assert.equal(await readFile(join(dir, "dist/README.md"), "utf8"), "kept on purpose");
+
+  // dist/ as its own checkout of the last deploy: the site's repository decides, not that one.
+  await writeFile(join(dir, ".gitignore"), "dist/\n.hotpress-cache/\n");
+  await rm(join(dir, "dist"), { recursive: true });
+  assert.equal((await build({ root: dir, log: false })).ok, true);
+  const deploy = join(dir, "dist");
+  gitInit(deploy);
+  execFileSync("git", ["add", "-A"], { cwd: deploy });
+  execFileSync("git", ["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "--quiet", "-m", "Deploy"], { cwd: deploy });
+  const oldCss = (await readdir(join(dir, "dist/assets"))).find((f) => f.endsWith(".css"))!;
+  await rm(join(dir, ".hotpress-cache"), { recursive: true, force: true });
+  await writeFile(join(dir, "styles/main.css"), (await readFile(join(dir, "styles/main.css"), "utf8")) + "\nh2 { color: red; }\n");
+  const result = await build({ root: dir, log: false });
+  assert.equal(result.ok, true, JSON.stringify(result.problems));
+  assert.equal(existsSync(join(dir, "dist/assets", oldCss)), false);
+  assert.equal(existsSync(join(dir, "dist/.git/HEAD")), true);
+});
+
 test("a git checkout in the out dir (a gh-pages clone, say) is never cleaned away", async () => {
   const dir = await copyExample();
   assert.equal((await build({ root: dir, log: false })).ok, true);

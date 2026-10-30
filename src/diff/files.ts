@@ -1,16 +1,22 @@
 import { readdir } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 
+/**
+ * Folders that hold version control or host metadata, never served files. Other dot-folders are served
+ * like any other (.well-known/security.txt, say).
+ */
+const METADATA = new Set([".git", ".hg", ".svn", ".netlify", ".vercel"]);
+
 /** Every file in an output directory, as site-relative paths ("about/index.html"). */
 export async function listFiles(root: string): Promise<string[]> {
   const out: string[] = [];
   async function walk(dir: string): Promise<void> {
     const entries = await readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
+      // A .git file too: a worktree's pointer to its repository.
+      if (METADATA.has(entry.name)) continue;
       const full = join(dir, entry.name);
       if (entry.isDirectory()) {
-        // Dot-directories hold host metadata (e.g. .netlify/), never served files.
-        if (entry.name.startsWith(".")) continue;
         await walk(full);
       } else if (entry.isFile()) {
         out.push(relative(root, full).split(sep).join("/"));

@@ -140,13 +140,13 @@ async function checkOutDir(
     fail(`the out dir "${outDir}" is outside the site, not empty, and wasn't written by a previous build`);
   }
   // With no record of a build here, a file the build would delete may be someone's own (docs/, say).
-  // Older versions kept one manifest for every out dir: what it lists was written by a build. So is an
-  // out dir the site's repository ignores as a whole (dist/ after the cache was deleted, say), apart from
-  // anything committed in it.
+  // Older versions kept one manifest for every out dir: what it lists was written by a build. So is a file
+  // the site's repository ignores in an out dir it ignores as a whole (dist/ after the cache was deleted,
+  // say); not one it un-ignores or tracks.
   let strays = existing.filter((file) => !outputs.has(file) && !(legacy && Object.hasOwn(legacy.files, file)));
   if (strays.length && ignoredBuildFolder(root, outDir)) {
-    const tracked = gitTracked(outDir);
-    strays = strays.filter((file) => tracked.has(file));
+    const ignored = gitIgnoredFiles(root, outDir, strays);
+    strays = strays.filter((file) => !ignored.has(file));
   }
   if (strays.length) {
     fail(
@@ -174,11 +174,23 @@ function ignoredBuildFolder(root: string, outDir: string): boolean {
   return ignored(".") === false && ignored(`${relative(root, outDir).split(sep).join("/")}/`) === true;
 }
 
-/** Files committed (or staged) under dir, relative to it. */
-function gitTracked(dir: string): Set<string> {
+/**
+ * Which of `files` (relative to outDir) the site's repository ignores. Asked from the root, so a checkout
+ * inside the out dir (a gh-pages clone) doesn't answer for it; tracked files are never ignored.
+ */
+function gitIgnoredFiles(root: string, outDir: string, files: string[]): Set<string> {
+  const prefix = `${relative(root, outDir).split(sep).join("/")}/`;
   try {
-    return new Set(execFileSync("git", ["ls-files", "-z", "--", "."], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split("\0").filter(Boolean));
+    const out = execFileSync("git", ["check-ignore", "--stdin", "-z"], {
+      cwd: root,
+      input: files.map((file) => `${prefix}${file}\0`).join(""),
+      encoding: "utf8",
+      maxBuffer: 1 << 30,
+      stdio: ["pipe", "pipe", "ignore"]
+    });
+    return new Set(out.split("\0").filter((path) => path.startsWith(prefix)).map((path) => path.slice(prefix.length)));
   } catch {
+    // Exit code 1: none of them is ignored.
     return new Set();
   }
 }
